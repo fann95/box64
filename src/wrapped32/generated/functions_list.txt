@@ -452,7 +452,7 @@
 #() vFbll_rllll_ -> vFBB
 #() iEbpppiiip_p -> iEBp
 #() iFXbiiuuLip_ -> iFXB
-#() iFpruuipWCCp_ -> iFpB
+#() iFpbuuipWCCp_ -> iFpB
 #() uFpbppuuuuup_ -> uFpB
 #() uFbppuuuuup_p -> uFBp
 #() pFubppuuuuup_ -> pFuB
@@ -875,6 +875,7 @@
 #() vFpbpu_u -> vFpBu
 #() vFpbpu_p -> vFpBp
 #() iFLbpi_i -> iFLBi
+#() iEpirLL_ -> iEpiB
 #() iFpibpu_ -> iFpiB
 #() iFpibpp_ -> iFpiB
 #() iFpubpu_ -> iFpuB
@@ -1355,7 +1356,7 @@
 #() iFXLuriiiiiLi_ -> iFXLuB
 #() uFnibpL_bLpCC_ -> uFniBB
 #() iFppubppuuuuup_ -> iFppuB
-#() iFpruuipWCCp_ll -> iFpBll
+#() iFpbuuipWCCp_ll -> iFpBll
 #() iFpbLL_bLL_bLL_ -> iFpBBB
 #() pFppibppuuuuup_ -> pFppiB
 #() vFXLbLLLLLLLLLL_L -> vFXLBL
@@ -1565,6 +1566,7 @@
 #() IFXpIII -> IFXpIII
 #() uEEippu -> uEEippu
 #() uFEpipp -> uFEpipp
+#() uFEppip -> uFEppip
 #() uFEpppp -> uFEpppp
 #() uFpuuup -> uFpuuup
 #() uFpuupu -> uFpuupu
@@ -2327,6 +2329,8 @@ wrappedfontconfig:
   - FcPatternBuild
 - pFppp:
   - FcFontList
+- uFppip:
+  - FcPatternGet
 - iFppiUi:
   - FcPatternAdd
 - pFppibp_p:
@@ -2339,6 +2343,7 @@ wrappedfreetype:
 - iFp:
   - FT_Activate_Size
   - FT_Done_Face
+  - FT_Done_FreeType
   - FT_Done_Size
   - FT_GlyphSlot_Own_Bitmap
   - FT_Has_PS_Glyph_Names
@@ -2464,6 +2469,7 @@ wrappedlibasound:
   - snd_device_name_hint
 - iFpppp:
   - snd_pcm_mmap_begin
+wrappedlibbsd:
 wrappedlibc:
 - vEv:
 - vFv:
@@ -3156,7 +3162,6 @@ wrappedlibpthread:
   - pthread_cond_wait@GLIBC_2.0
   - pthread_key_create
   - pthread_mutex_init
-  - pthread_mutex_timedlock
   - pthread_once
   - pthread_rwlock_init
   - sem_getvalue
@@ -3166,6 +3171,7 @@ wrappedlibpthread:
 - iEhp:
   - pthread_getattr_np
 - iEprLL_:
+  - pthread_mutex_timedlock
   - sem_timedwait
 - vEppp:
   - _pthread_cleanup_push
@@ -3186,6 +3192,8 @@ wrappedlibpthread:
   - pthread_setaffinity_np
 - pEpOM:
   - sem_open
+- iEpirLL_:
+  - pthread_mutex_clocklock
 - iEpprLL_:
   - pthread_cond_timedwait
   - pthread_cond_timedwait@GLIBC_2.0

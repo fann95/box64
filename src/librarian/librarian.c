@@ -155,7 +155,7 @@ static void MapLibAddMapLib(lib_t* dest, library_t* lib_src, lib_t* src)
         if(!lib || libraryInMapLib(dest, lib)) continue;
         MapLibAddLib(dest, lib);
     }
-    if(lib_src == owner)
+    if(box64_is32bits && lib_src == owner)
         FreeLibrarian(&src, NULL);
 }
 
@@ -171,6 +171,35 @@ void MapLibRemoveLib(lib_t* maplib, library_t* lib)
     if(idx!=(maplib->libsz))
         memmove(&maplib->libraries[idx], &maplib->libraries[idx+1], sizeof(library_t*)*(maplib->libsz-idx));
     maplib->libraries[maplib->libsz] = NULL;
+}
+
+void DetachLibraryMaplib(library_t* lib, x64emu_t* emu, int unloading)
+{
+    lib_t* maplib = lib->maplib;
+    int owned = !lib->maplib_ref;
+    lib->maplib = NULL;
+    lib->maplib_ref = 0;
+    if(!maplib)
+        return;
+    if(box64_is32bits) {
+        if(owned)
+            FreeLibrarian(&maplib, emu);
+        return;
+    }
+    if(unloading)
+        MapLibRemoveLib(maplib, lib);
+    if(!owned)
+        return;
+    // Dependencies can outlive the original dlopen owner, including during TLS cleanup.
+    for(int i=0; i<maplib->libsz; ++i) {
+        library_t* next = maplib->libraries[i];
+        if(next && next->type!=LIB_UNNKNOW && next->maplib==maplib) {
+            next->maplib_ref = 0;
+            maplib->owner = next;
+            return;
+        }
+    }
+    FreeLibrarian(&maplib, emu);
 }
 
 static void MapLibRemoveMapLib(lib_t* dest, lib_t* src)
@@ -196,13 +225,19 @@ void promoteLocalLibGlobal(library_t* lib)
         return;
     // promote lib from local to global...
     // for add the depending local libs...
-    if(lib->maplib && !lib->maplib_ref) {
-        lib_t* maplib = lib->maplib;
+    if(box64_is32bits) {
+        if(lib->maplib && !lib->maplib_ref) {
+            lib_t* maplib = lib->maplib;
+            lib->maplib = NULL;
+            MapLibAddMapLib(my_context->maplib, lib, maplib);
+        }
         lib->maplib = NULL;
-        MapLibAddMapLib(my_context->maplib, lib, maplib);
+        lib->maplib_ref = 0;
+    } else {
+        if(lib->maplib && !lib->maplib_ref)
+            MapLibAddMapLib(my_context->maplib, lib, lib->maplib);
+        DetachLibraryMaplib(lib, NULL, 0);
     }
-    lib->maplib = NULL;
-    lib->maplib_ref = 0;
     if(!libraryInMapLib(my_context->maplib, lib))
         MapLibAddLib(my_context->maplib, lib);
     MapLibRemoveMapLib(my_context->local_maplib, my_context->maplib);

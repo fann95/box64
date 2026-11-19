@@ -530,7 +530,7 @@ dynablock_t* CreateEmptyBlock(uintptr_t addr, int is32bits, int is_new) {
     block->block = p;
     block->jmpnext = p;
     block->is32bits = is32bits;
-    *(dynablock_t**)actual_p = block;
+    __atomic_store_n((dynablock_t**)actual_p, block, __ATOMIC_RELEASE);
     *(void**)(p+JMPNEXT_SIZE-2*sizeof(void*)) = native_epilog;
     CreateJmpNext(block->jmpnext, p+JMPNEXT_SIZE-2*sizeof(void*));
     // all done...
@@ -919,7 +919,7 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
             helper.tablestart = (uintptr_t)tablestart;
             helper.jmp_next = (uintptr_t)next+sizeof(void*);
             helper.instsize = (instsize_t*)instsize;
-            *(dynablock_t**)actual_p = block;
+            __atomic_store_n((dynablock_t**)actual_p, block, __ATOMIC_RELEASE);
             helper.table64cap = helper.table64size;
             helper.table64 = (uint64_t*)helper.tablestart;
             helper.callrets = (callret_t*)callrets;

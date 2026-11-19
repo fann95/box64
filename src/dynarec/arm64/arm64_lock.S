@@ -17,6 +17,8 @@
 .global arm64_lock_write_dd
 .global arm64_lock_read_dq
 .global arm64_lock_write_dq
+.global arm64_lock_xadd_unaligned
+.global arm64_lock_rmw_unaligned
 .global arm64_lock_xchg_dd
 .global arm64_lock_xchg_d
 .global arm64_lock_xchg_h
@@ -45,6 +47,209 @@ arm64_lock_read_b:
     // address is x0, return is x0
     ldaxrb  w0, [x0]
     ret
+
+// x1: address, x2: addend, w3: size (2, 4 or 8).
+// The caller checks that the field fits in one aligned 16-byte block.
+// Update its containing word/pair exclusively, preserving surrounding bytes.
+#ifndef _WIN32
+.type arm64_lock_xadd_unaligned, %function
+#endif
+arm64_lock_xadd_unaligned:
+    dmb     ish
+    and     x4, x1, #-8
+    and     x5, x1, #7
+    add     x7, x5, x3
+    lsl     x5, x5, #3
+    lsl     x6, x3, #3
+    neg     x6, x6
+    mov     x3, #-1
+    lsr     x6, x3, x6       // field mask, including the 64-bit case
+    cmp     x7, #8
+    b.hi    2f
+    lsl     x7, x6, x5       // mask in the containing word
+1:
+    ldaxr   x8, [x4]
+    lsr     x0, x8, x5
+    and     x0, x0, x6
+    add     x9, x0, x2
+    and     x9, x9, x6
+    bic     x10, x8, x7
+    lsl     x9, x9, x5
+    orr     x10, x10, x9
+    stlxr   w11, x10, [x4]
+    cbnz    w11, 1b
+    dmb     ish
+    ret
+2:
+    // Crossing the middle of the block: x4 is now 16-byte aligned,
+    // and the shift is strictly between 0 and 64.
+    neg     x7, x5
+    lsl     x12, x6, x5      // low half of the field mask
+    lsr     x13, x6, x7      // high half of the field mask
+3:
+    ldaxp   x8, x9, [x4]
+    lsr     x0, x8, x5
+    lsl     x10, x9, x7
+    orr     x0, x0, x10
+    and     x0, x0, x6
+    add     x10, x0, x2
+    and     x10, x10, x6
+    bic     x8, x8, x12
+    lsl     x11, x10, x5
+    orr     x8, x8, x11
+    bic     x9, x9, x13
+    lsr     x11, x10, x7
+    orr     x9, x9, x11
+    stlxp   w14, x8, x9, [x4]
+    cbnz    w14, 3b
+    dmb     ish
+    ret
+#ifndef _WIN32
+.size arm64_lock_xadd_unaligned, .-arm64_lock_xadd_unaligned
+#endif
+
+// Operation numbers match arm64_rmw_op_t in arm64_lock.h.
+.macro RMW_SELECT kind
+    cbz     w15, .Lrmw_\kind\()_add
+    cmp     w15, #1
+    b.eq    .Lrmw_\kind\()_or
+    cmp     w15, #2
+    b.eq    .Lrmw_\kind\()_adc
+    cmp     w15, #3
+    b.eq    .Lrmw_\kind\()_and
+    cmp     w15, #4
+    b.eq    .Lrmw_\kind\()_xchg
+    cmp     w15, #5
+    b.eq    .Lrmw_\kind\()_cmpxchg
+    cmp     w15, #6
+    b.eq    .Lrmw_\kind\()_sub
+    cmp     w15, #7
+    b.eq    .Lrmw_\kind\()_xor
+    brk     #0
+.endm
+
+.macro RMW_VALUE out, op
+    .ifc \op,add
+        add     \out, x0, x2
+    .endif
+    .ifc \op,or
+        orr     \out, x0, x2
+    .endif
+    .ifc \op,adc
+        add     \out, x0, x2
+        add     \out, \out, x16
+    .endif
+    .ifc \op,and
+        and     \out, x0, x2
+    .endif
+    .ifc \op,xchg
+        mov     \out, x2
+    .endif
+    .ifc \op,cmpxchg
+        cmp     x0, x16
+        csel    \out, x2, x0, eq
+    .endif
+    .ifc \op,sub
+        sub     \out, x0, x2
+    .endif
+    .ifc \op,xor
+        eor     \out, x0, x2
+    .endif
+.endm
+
+// x0: unused emu, x1: field address, x2: value, w3: size,
+// w4: operation, x5: carry-in / expected value. Return old field in x0.
+// The caller verifies that the field fits inside one aligned 16-byte block.
+#ifndef _WIN32
+.type arm64_lock_rmw_unaligned, %function
+#endif
+arm64_lock_rmw_unaligned:
+    dmb     ish
+    mov     w15, w4
+    mov     x16, x5
+    and     x4, x1, #-8
+    and     x5, x1, #7
+    add     x7, x5, x3
+    lsl     x5, x5, #3
+    lsl     x6, x3, #3
+    neg     x6, x6
+    mov     x3, #-1
+    lsr     x6, x3, x6
+    and     x2, x2, x6
+    and     x16, x16, x6
+    cmp     x7, #8
+    b.hi    .Lrmw_pair_setup
+    lsl     x7, x6, x5
+    RMW_SELECT word
+.Lrmw_pair_setup:
+    neg     x7, x5
+    lsl     x12, x6, x5
+    lsr     x13, x6, x7
+    RMW_SELECT pair
+
+// Dispatch occurs before LDXR/LDXP, keeping each exclusive window short.
+.macro RMW_WORD op
+.Lrmw_word_\op:
+    ldaxr   x8, [x4]
+    lsr     x0, x8, x5
+    and     x0, x0, x6
+    RMW_VALUE x9, \op
+    and     x9, x9, x6
+    bic     x10, x8, x7
+    lsl     x9, x9, x5
+    orr     x10, x10, x9
+    stlxr   w11, x10, [x4]
+    cbnz    w11, .Lrmw_word_\op
+    b       .Lrmw_done
+.endm
+
+.macro RMW_PAIR op
+.Lrmw_pair_\op:
+    ldaxp   x8, x9, [x4]
+    lsr     x0, x8, x5
+    lsl     x10, x9, x7
+    orr     x0, x0, x10
+    and     x0, x0, x6
+    RMW_VALUE x10, \op
+    and     x10, x10, x6
+    bic     x8, x8, x12
+    lsl     x11, x10, x5
+    orr     x8, x8, x11
+    bic     x9, x9, x13
+    lsr     x11, x10, x7
+    orr     x9, x9, x11
+    // Validate even a failed CMPXCHG: LDAXP alone can observe a torn pair.
+    stlxp   w14, x8, x9, [x4]
+    cbnz    w14, .Lrmw_pair_\op
+    b       .Lrmw_done
+.endm
+
+    RMW_WORD add
+    RMW_WORD or
+    RMW_WORD adc
+    RMW_WORD and
+    RMW_WORD xchg
+    RMW_WORD cmpxchg
+    RMW_WORD sub
+    RMW_WORD xor
+    RMW_PAIR add
+    RMW_PAIR or
+    RMW_PAIR adc
+    RMW_PAIR and
+    RMW_PAIR xchg
+    RMW_PAIR cmpxchg
+    RMW_PAIR sub
+    RMW_PAIR xor
+.Lrmw_done:
+    dmb     ish
+    ret
+#ifndef _WIN32
+.size arm64_lock_rmw_unaligned, .-arm64_lock_rmw_unaligned
+#endif
+.purgem RMW_SELECT
+.purgem RMW_VALUE
+.purgem RMW_WORD
+.purgem RMW_PAIR
 
 arm64_lock_write_b:
     // address is x0, value is x1, return is x0

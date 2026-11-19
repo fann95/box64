@@ -105,6 +105,9 @@ typedef enum arm64_consts_s {
     const_4f_1_m1_1_m1,
     const_2d_1_m1,
 
+    const_arm64_lock_xadd_unaligned,
+    const_arm64_lock_rmw_unaligned,
+
     const_last
 } arm64_consts_t;
 

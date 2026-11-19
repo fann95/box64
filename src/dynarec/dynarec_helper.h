@@ -86,7 +86,8 @@
 #define SMEND()                                                                                \
     do {                                                                                       \
         /* If there is any guest memory write, which is a SEQ, then compute the last_write. */ \
-        if (dyn->smwrite && (STRONGMEM_LEVEL() >= STRONGMEM_LAST_WRITE)) {                     \
+        /* At block exit ninst points past the instructions, into a cleared slot. */           \
+        if (dyn->smwrite && (ninst >= dyn->size || STRONGMEM_LEVEL() >= STRONGMEM_LAST_WRITE)) { \
             int i = ninst;                                                                     \
             while (i >= 0 && !dyn->insts[i].will_write)                                        \
                 --i;                                                                           \
@@ -193,7 +194,7 @@
 // Will be put at the end of the SEQ
 #define SMEND()                                                         \
     do {                                                                \
-        if (STRONGMEM_LEVEL()) {                                        \
+        if (ninst >= dyn->size || STRONGMEM_LEVEL()) {                    \
             /* It's a SEQ, put a barrier here. */                       \
             if (dyn->smwrite) {                                         \
                 /* Check if the next instruction has a end loop mark */ \

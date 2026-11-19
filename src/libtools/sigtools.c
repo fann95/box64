@@ -90,8 +90,12 @@ void getUnalignedRange(uintptr_t start, size_t size, uintptr_t addrs[])
 int mark_db_unaligned(dynablock_t* db, uintptr_t x64pc)
 {
     add_unaligned_address(x64pc);
-    db->to_delete = 1; // mark block for deletion
-    MarkDynablock(db);      // and mark it as dirty
+    int memory_lock = LockDynablockMemory();
+    if(IsDynablockLive(db) && !db->gone) {
+        db->to_delete = 1; // mark block for deletion
+        MarkDynablock(db);      // and mark it as dirty
+    }
+    UnlockDynablockMemory(memory_lock);
 if(BOX64ENV(showsegv)) printf_log(LOG_INFO, "Marked db %p as dirty, and address %p as needing unaligned handling\n", db, (void*)x64pc);
     return 2;   // marked, exit handling...
 }
@@ -99,8 +103,12 @@ if(BOX64ENV(showsegv)) printf_log(LOG_INFO, "Marked db %p as dirty, and address 
 int mark_db_autosmc(dynablock_t* db, uintptr_t x64pc)
 {
     add_autosmc_address(x64pc);
-    db->to_delete = 1; // mark block for deletion
-    MarkDynablock(db);      // and mark it as dirty
+    int memory_lock = LockDynablockMemory();
+    if(IsDynablockLive(db) && !db->gone) {
+        db->to_delete = 1; // mark block for deletion
+        MarkDynablock(db);      // and mark it as dirty
+    }
+    UnlockDynablockMemory(memory_lock);
 if(BOX64ENV(showsegv)) printf_log(LOG_INFO, "Marked db %p as dirty, and address %p as creating internal SMC\n", db, (void*)x64pc);
     return 2;   // marked, exit handling...
 }

@@ -35,6 +35,7 @@
 #include "dynarec/dynarec_next.h"
 #include "dynacache_compress.h"
 #include "freq.h"
+#include "perfmap.h"
 
 // init inside dynablocks.c
 static mmaplist_t          *mmaplist = NULL;
@@ -134,7 +135,8 @@ typedef struct blocklist_s {
 static int                 n_blocks = 0;       // number of blocks for custom malloc
 static int                 c_blocks = 0;       // capacity of blocks for custom malloc
 static blocklist_t*        p_blocks = NULL;    // actual blocks for custom malloc
-static int                 setting_prot = 0;
+// Only allocations made by this protection-lock owner may defer registration.
+static __thread int        setting_prot = 0;
 
 // Block lookup cache (shared for findBlock/free)
 static int last_block_index = -1;
@@ -590,10 +592,10 @@ int isCustomAddr(void* p)
 #define UNLOCK_DYNAREC()
 #define UNLOCK_NODYNAREC()  UNLOCK_PROT()
 #endif
-static uintptr_t    defered_prot_p = 0;
-static size_t       defered_prot_sz = 0;
-static uint32_t     defered_prot_prot = 0;
-static mem_flag_t   defered_prot_flags = MEM_ALLOCATED;
+static __thread uintptr_t    defered_prot_p = 0;
+static __thread size_t       defered_prot_sz = 0;
+static __thread uint32_t     defered_prot_prot = 0;
+static __thread mem_flag_t   defered_prot_flags = MEM_ALLOCATED;
 
 #ifdef _WIN32
 void enter_critical_section(void) {}
@@ -645,6 +647,42 @@ static void setProtection_generic(uintptr_t addr, size_t sz, uint32_t prot, mem_
     do {                           \
         mutex_unlock(&mutex_prot); \
     } while (0)
+
+#ifdef DYNAREC
+int LockDynablockMemory(void)
+{
+    enter_critical_section();
+    int token = 1;
+#ifdef USE_CUSTOM_MUTEX
+    if(native_lock_get_d(&mutex_prot) == (uint32_t)GetTID())
+        token = 0;
+    else
+        mutex_lock(&mutex_prot);
+#else
+    int error = mutex_lock(&mutex_prot);
+    if(error == EDEADLK)
+        token = 0;
+    else if(error) {
+        printf_log(LOG_NONE, "Cannot lock dynablock metadata: %d\n", error);
+        abort();
+    }
+#endif
+    // Jump-table allocation can allocate custom memory. Defer its protection
+    // update until the outer protection lock is released.
+    ++setting_prot;
+    return token;
+}
+
+void UnlockDynablockMemory(int token)
+{
+    --setting_prot;
+    if(token) {
+        UNLOCK_PROT();
+    } else {
+        leave_critical_section();
+    }
+}
+#endif
 
 #ifdef TRACE_MEMSTAT
 static uint64_t customMalloc_allocated = 0;
@@ -1537,6 +1575,11 @@ int MmaplistAddBlock_internal(mmaplist_t* list, void* map, void* orig, size_t si
     void* p = list->chunks[i]->block;
     void* end = map + size - sizeof(blockmark_t);
     while(p<end) {
+        // Reclaiming a stale allocation can merge both adjacent free blocks.
+        // Keep the next live mark, which cannot be removed by that coalescing.
+        blockmark_t* next = NEXT_BLOCK((blockmark_t*)p);
+        while((void*)next<end && !next->next.fill)
+            next = NEXT_BLOCK(next);
         if(((blockmark_t*)p)->next.fill) {
             void** b = (void**)((blockmark_t*)p)->mark;
             // first is the address of the dynablock itself, that needs to be adjusted
@@ -1564,23 +1607,33 @@ int MmaplistAddBlock_internal(mmaplist_t* list, void* map, void* orig, size_t si
                 db_ref = (bl->jmpnext-sizeof(void*)+3*sizeof(void*));
                 *db_ref = native_next;
             }
+            if (bl->retire_lost) {
+                // A saved retirement request belongs to the previous process.
+                // This block was never added to this process's size accounting.
+                bl->retire_lost = 0;
+                bl->gone = 1;
+                bl->done = 0;
+            }
             if(bl->gone || !bl->done || bl->to_delete) {
                 dynarec_log(LOG_DEBUG, "Skipping stale DynCache block %p for %p (done=%d, gone=%d, to_delete=%d)\n", bl, bl->x64_addr, bl->done, bl->gone, bl->to_delete);
-                p = NEXT_BLOCK((blockmark_t*)p);
-                continue;
+                goto discard_block;
             }
             // adjust guest source addresses with delta_map
             bl->x64_addr += delta_map;
             bl->x64_readaddr += delta_map;
             *(uintptr_t*)(bl->jmpnext+2*sizeof(void*)) = RelocGetNext();
-            if(bl->relocs && bl->relocsize)
-                ApplyRelocs(bl, delta, delta_map, mapping_start);
+            if(bl->relocs && bl->relocsize && ApplyRelocs(bl, delta, delta_map, mapping_start)<0) {
+                dynarec_log(LOG_INFO, "Skipping DynCache block %p after a relocation failure\n", bl);
+                goto discard_block;
+            }
             ClearCache(bl->jmpnext, 4*sizeof(void*));
             ClearCache(bl->actual_block+sizeof(void*), bl->native_size);
+            writeJitProfileLoad(bl);
             //add block, as dirty for now
             if(!addJumpTableIfDefault64(bl->x64_addr, bl->jmpnext)) {
                 // cannot add blocks?
                 printf_log(LOG_INFO, "Warning, cannot add DynaCache Block %d to JmpTable\n", i);
+                goto discard_block;
             } else {
                 if(bl->x64_size) {
                     dynarec_log(LOG_DEBUG, "Added DynCache bl %p for %p - %p\n", bl, bl->x64_addr, bl->x64_addr+bl->x64_size);
@@ -1591,12 +1644,27 @@ int MmaplistAddBlock_internal(mmaplist_t* list, void* map, void* orig, size_t si
                     rb_inc(my_context->db_sizes, bl->x64_size, bl->x64_size+1);
                 }
             }
+            p = next;
+            continue;
 
+discard_block:
+            {
+                // Never published or counted: return storage directly, without
+                // the accounting and deferred retirement of a live dynablock.
+                writeJitProfileUnload(bl);
+                size_t available = freeBlock(list->chunks[i]->block, list->chunks[i]->size,
+                    (blockmark_t*)p, &list->chunks[i]->first);
+                if(list->chunks[i]->maxfree<available)
+                    list->chunks[i]->maxfree = available;
+            }
         }
-        p = NEXT_BLOCK((blockmark_t*)p);
+        p = next;
     }
-    // add new block to rbtt_dynmem
+    // Cached entries are published dirty and cannot be validated until the
+    // caller releases dyndump. Expose the allocation index only when complete.
+    int memory_lock = LockDynablockMemory();
     rb_set_64(rbt_dynmem, (uintptr_t)map, (uintptr_t)map+size, (uintptr_t)list->chunks[i]);
+    UnlockDynablockMemory(memory_lock);
 
     return 0;
 }
@@ -1651,31 +1719,62 @@ void MmaplistFillBlocks(mmaplist_t* list, CompressedDynaCacheBlock_t* blocks)
     }
 }
 
+static int cleanDBFromAddressRange_internal(uintptr_t addr, size_t size, int destroy, int locked);
+
 void DelMmaplist(mmaplist_t* list)
 {
     if(!list) return;
+    // RemoveMapping detaches the list before dropping the JIT lock. Reacquire
+    // it before modifying the native allocation index or unmapping its nodes.
+    mutex_lock(&my_context->mutex_dyndump);
     for(int i=0; i<list->size; ++i)
         if(list->chunks[i]->size) {
-            cleanDBFromAddressRange((uintptr_t)list->chunks[i]->block, list->chunks[i]->size, 1);
+            cleanDBFromAddressRange_internal((uintptr_t)list->chunks[i]->block, list->chunks[i]->size, 1, 1);
             DeferFreeDynablockClearRange(list->chunks[i]->block, list->chunks[i]->size);
-            rb_unset(rbt_dynmem, (uintptr_t)list->chunks[i]->block, (uintptr_t)list->chunks[i]->block+list->chunks[i]->size);
             // the blocklist_t "chunk" structure is port of the memory map, so grab info before freing the memory
             // also need to include back the blocklist_t that is excluded from the blocklist tracking
             void* addr = list->chunks[i]->block - sizeof(blocklist_t);
             size_t size = list->chunks[i]->size + sizeof(blocklist_t);
+            int memory_lock = LockDynablockMemory();
+            if(jitProfileActive()) {
+                blockmark_t* mark = list->chunks[i]->block;
+                while(mark->next.offs) {
+                    if(mark->next.fill) {
+                        uintptr_t allocation = (uintptr_t)mark->mark;
+                        size_t allocation_size = SIZE_BLOCK(mark->next);
+                        dynablock_t* db = __atomic_load_n((dynablock_t**)allocation, __ATOMIC_ACQUIRE);
+                        if(db && (uintptr_t)db >= allocation && !((uintptr_t)db % _Alignof(dynablock_t))
+                            && allocation_size >= sizeof(*db)
+                            && (uintptr_t)db - allocation <= allocation_size - sizeof(*db)
+                            && IsDynablockLive(db) && db->actual_block == (void*)allocation)
+                            writeJitProfileUnload(db);
+                    }
+                    mark = NEXT_BLOCK(mark);
+                }
+            }
+            // The native-address index includes the chunk header too.
+            rb_unset(rbt_dynmem, (uintptr_t)addr, (uintptr_t)addr + size);
             #ifdef BOX64EC
             UnregisterDynarecUnwind(list->chunks[i]->unwind_table);
             #endif
             int isReserved = box64_is32bits && (uintptr_t)addr>0xffffffffLL;
             InternalMunmap(addr, size);
+            UnlockDynablockMemory(memory_lock);
             // check if memory should be protected and alloced for box32
             if(isReserved) {
                 //rereserve and mark as reserved
-                if(InternalMmap(addr, size, 0, MAP_NORESERVE|MAP_ANONYMOUS|MAP_FIXED, -1, 0)!=MAP_FAILED)
+                if(InternalMmap(addr, size, 0, MAP_NORESERVE|MAP_ANONYMOUS|MAP_FIXED, -1, 0)!=MAP_FAILED) {
+                    LOCK_PROT();
                     rb_set(mapallmem, (uintptr_t)addr, (uintptr_t)addr+size, MEM_RESERVED);
-            } else
+                    UNLOCK_PROT();
+                }
+            } else {
+                LOCK_PROT();
                 rb_unset(mapallmem, (uintptr_t)addr, (uintptr_t)addr+size);
+                UNLOCK_PROT();
+            }
         }
+    mutex_unlock(&my_context->mutex_dyndump);
     box_free(list->chunks);
     box_free(list);
 }
@@ -1692,18 +1791,29 @@ dynablock_t* FindDynablockFromNativeAddress(void* p)
         // browse the map allocation as a fallback
         blockmark_t* sub = (blockmark_t*)bl->block;
         while((uintptr_t)sub<addr) {
+            if(!sub->next.offs)
+                return NULL;
             blockmark_t* n = NEXT_BLOCK(sub);
+            if(n<=sub || (uintptr_t)n>(uintptr_t)bl->block+bl->size-sizeof(blockmark_t))
+                return NULL;
             if((uintptr_t)n>addr) {
                 // found it!
                 if(!sub->next.fill) return NULL; // empty space?
                 // self is the field of a block
                 dynablock_t** ret = (dynablock_t**)((uintptr_t)sub+sizeof(blockmark_t));
-                return *ret;
+                return __atomic_load_n(ret, __ATOMIC_ACQUIRE);
             }
             sub = n;
         }
     }
     return NULL;
+}
+
+int IsDynablockLive(dynablock_t* db)
+{
+    // Treat the incoming pointer only as an address until the live allocator
+    // has identified its self-reference. This also rejects a removed mapping.
+    return db && rbt_dynmem && FindDynablockFromNativeAddress(db) == db;
 }
 
 #ifdef TRACE_MEMSTAT
@@ -1725,6 +1835,7 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
     list->dirty = 1;
     // check if there is space in current open ones
     uintptr_t sz = size + 2*sizeof(blockmark_t);
+    int memory_lock = LockDynablockMemory();
     for(int i=0; i<list->size; ++i) {
         if(list->chunks[i]->maxfree>=size) {
             // looks free, try to alloc!
@@ -1734,11 +1845,14 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
                 void* ret = allocBlock(list->chunks[i]->block, sub, size, &list->chunks[i]->first);
                 if(rsize==list->chunks[i]->maxfree)
                     list->chunks[i]->maxfree = getMaxFreeBlock(list->chunks[i]->block, list->chunks[i]->size, list->chunks[i]->first);
+                __atomic_store_n((dynablock_t**)ret, NULL, __ATOMIC_RELEASE);
+                UnlockDynablockMemory(memory_lock);
                 //rb_set_64(list->chunks[i].tree, (uintptr_t)ret, (uintptr_t)ret+size, (uintptr_t)ret);
                 return (uintptr_t)ret;
             }
         }
     }
+    UnlockDynablockMemory(memory_lock);
     // need to add a new
     if(list->size == list->cap) {
         list->cap+=4;
@@ -1787,6 +1901,7 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
         dynarec_log(LOG_NONE, "Custommem: allocation %p-%p for Dynarec %p->chunk[%d]\n", p, p+allocsize, list, i);
 #endif
     setProtection_box((uintptr_t)p, allocsize, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memory_lock = LockDynablockMemory();
     list->chunks[i] = p;
     rb_set_64(rbt_dynmem, (uintptr_t)p, (uintptr_t)p+allocsize, (uintptr_t)list->chunks[i]);
     p = p + sizeof(blocklist_t);    // adjust pointer and size, to exclude blocklist_t itself
@@ -1809,9 +1924,11 @@ uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new)
     #endif
     // alloc 1st block
     void* ret  = allocBlock(list->chunks[i]->block, p, size, &list->chunks[i]->first);
+    __atomic_store_n((dynablock_t**)ret, NULL, __ATOMIC_RELEASE);
     list->chunks[i]->maxfree = getMaxFreeBlock(list->chunks[i]->block, list->chunks[i]->size, list->chunks[i]->first);
     if(list->chunks[i]->maxfree)
         list->chunks[i]->first = getNextFreeBlock(m);
+    UnlockDynablockMemory(memory_lock);
     //rb_set_64(list->chunks[i].tree, (uintptr_t)ret, (uintptr_t)ret+size, (uintptr_t)ret);
     return (uintptr_t)ret;
 }
@@ -1822,14 +1939,66 @@ void FreeDynarecMap(uintptr_t addr)
         return;
 
 
+    int memory_lock = LockDynablockMemory();
     blocklist_t* bl = (blocklist_t*)rb_get_64(rbt_dynmem, addr);
 
     if(bl) {
-        void* sub = (void*)(addr-sizeof(blockmark_t));
+        blockmark_t* sub = (blockmark_t*)(addr-sizeof(blockmark_t));
+        if(jitProfileActive()) {
+            size_t allocation_size = SIZE_BLOCK(sub->next);
+            dynablock_t* db = __atomic_load_n((dynablock_t**)addr, __ATOMIC_ACQUIRE);
+            if(db && (uintptr_t)db >= addr && !((uintptr_t)db % _Alignof(dynablock_t))
+                && allocation_size >= sizeof(*db)
+                && (uintptr_t)db - addr <= allocation_size - sizeof(*db)
+                && IsDynablockLive(db) && db->actual_block == (void*)addr)
+                writeJitProfileUnload(db);
+        }
         size_t newfree = freeBlock(bl->block, bl->size, sub, &bl->first);
         if(bl->maxfree < newfree)
             bl->maxfree = newfree;
+    }
+    UnlockDynablockMemory(memory_lock);
+}
+
+static uint32_t lost_dynablocks_pending;
+
+void DeferLostDynablock(dynablock_t* db)
+{
+    __atomic_store_n(&db->retire_lost, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&lost_dynablocks_pending, 1, __ATOMIC_RELEASE);
+}
+
+void RetireLostDynablocks(void)
+{
+    if (!__atomic_load_n(&lost_dynablocks_pending, __ATOMIC_ACQUIRE)
+        || !__atomic_exchange_n(&lost_dynablocks_pending, 0, __ATOMIC_ACQ_REL))
         return;
+
+    // Scan live allocations rather than retaining pointers into cache mappings
+    // that may have been unmapped since the mark. This rare path owns dyndump.
+    uintptr_t cur = rb_get_leftmost(rbt_dynmem);
+    while (cur != UINTPTR_MAX) {
+        uintptr_t end;
+        uint64_t value;
+        if (rb_get_end_64(rbt_dynmem, cur, &value, &end)) {
+            blocklist_t* chunk = (blocklist_t*)value;
+            blockmark_t* mark = (blockmark_t*)chunk->block;
+            while (mark->next.offs) {
+                if (mark->next.fill) {
+                    dynablock_t* db = __atomic_load_n((dynablock_t**)mark->mark, __ATOMIC_ACQUIRE);
+                    if (db && __atomic_exchange_n(&db->retire_lost, 0, __ATOMIC_ACQ_REL) && !db->gone) {
+                        if (getDB((uintptr_t)db->x64_addr) != db)
+                            FreeDynablock(db, 0, 0);
+                        else
+                            MarkDynablock(db); // A republished block still needs the original dirty mark.
+                    }
+                }
+                // Retirement can coalesce adjacent free allocations. The current
+                // live allocation remains queued, so read its updated next mark.
+                mark = NEXT_BLOCK(mark);
+            }
+        }
+        cur = end;
     }
 }
 
@@ -1890,8 +2059,8 @@ void addDBFromAddressRange(uintptr_t addr, size_t size)
     }
 }
 
-// Will return 1 if at least 1 db in the address range
-int cleanDBFromAddressRange(uintptr_t addr, size_t size, int destroy)
+// locked is used only for destruction while mutex_dyndump is already held.
+static int cleanDBFromAddressRange_internal(uintptr_t addr, size_t size, int destroy, int locked)
 {
     uintptr_t start_addr = my_context?((addr<my_context->max_db_size)?0:(addr-my_context->max_db_size)):addr;
     dynarec_log(LOG_DEBUG, "cleanDBFromAddressRange %p/%p -> %p %s\n", (void*)addr, (void*)start_addr, (void*)(addr+size-1), destroy?((destroy==2)?"invalidCRC":"destroy"):"mark");
@@ -1904,12 +2073,35 @@ int cleanDBFromAddressRange(uintptr_t addr, size_t size, int destroy)
             ret = 1;
             switch(destroy) {
                 case 0: MarkRangeDynablock(db, addr, size); break;
-                case 1: FreeRangeDynablock(db, addr, size); break;
+                case 1:
+                    if (locked) {
+                        // Keep the same range check as FreeRangeDynablock without
+                        // recursively acquiring the non-recursive dynarec mutex.
+                        if ((uintptr_t)db->x64_addr <= addr + size + 1 && (uintptr_t)db->x64_addr + db->x64_size - 1 >= addr)
+                            FreeDynablock(db, 0, 1);
+                    } else {
+                        FreeRangeDynablock(db, addr, size);
+                    }
+                    break;
                 case 2: MarkCRCRangeDynablock(db, addr, size); break;
             }
 
         }
     }
+    return ret;
+}
+
+// Will return 1 if at least 1 db in the address range
+int cleanDBFromAddressRange(uintptr_t addr, size_t size, int destroy)
+{
+    int locked = destroy == 1 && my_context;
+    if(locked)
+        mutex_lock(&my_context->mutex_dyndump);
+    int memory_lock = LockDynablockMemory();
+    int ret = cleanDBFromAddressRange_internal(addr, size, destroy, locked);
+    UnlockDynablockMemory(memory_lock);
+    if(locked)
+        mutex_unlock(&my_context->mutex_dyndump);
     return ret;
 }
 
@@ -2084,6 +2276,20 @@ int setJumpTableIfRef64(void* addr, void* jmp, void* ref)
     idx2 = (((uintptr_t)addr)>>JMPTABL_START2)&JMPTABLE_MASK2;
     idx1 = (((uintptr_t)addr)>>JMPTABL_START1)&JMPTABLE_MASK1;
     idx0 = (((uintptr_t)addr)    )&JMPTABLE_MASK0;
+    // A missing table contains only native_next, so it cannot match a live
+    // block reference. Marking a lost block must not allocate those tables.
+    if(ref != native_next) {
+        #ifdef JMPTABL_SHIFT4
+        if(box64_jmptbl3[idx3] == box64_jmptbldefault2)
+            return jmp == native_next;
+        uintptr_t*** table2 = box64_jmptbl3[idx3];
+        #else
+        uintptr_t*** table2 = box64_jmptbl2;
+        #endif
+        if(table2[idx2] == box64_jmptbldefault1
+            || table2[idx2][idx1] == box64_jmptbldefault0)
+            return jmp == native_next;
+    }
     #ifdef JMPTABL_SHIFT4
     void* ret = native_lock_storeifref2(create_jmptbl(0, idx0, idx1, idx2, idx3), jmp, ref);
     #else
@@ -2681,15 +2887,23 @@ void updateDBHostProtectionForGuestRange(uintptr_t addr, size_t size)
 
 #endif
 
+static void catchup_brk_protection(void);
+
 void updateProtection(uintptr_t addr, size_t size, uint32_t prot)
 {
     dynarec_log(LOG_DEBUG, "updateProtection %p:%p 0x%hhx\n", (void*)addr, (void*)(addr+size-1), prot);
+    // Record heap growth before a new mprotect overrides its default permissions.
+    catchup_brk_protection();
+    #ifdef DYNAREC
+    int check = BOX64ENV(dynarec);
+    // PROT_NONE can destroy blocks. Match the JIT's dyndump -> prot order.
+    int destroy_locked = check && !prot && my_context;
+    if (destroy_locked)
+        mutex_lock(&my_context->mutex_dyndump);
+    #endif
     LOCK_PROT();
     uintptr_t cur = ALIGN_DOWN(addr);
     uintptr_t end = ALIGN(cur+size);
-    #ifdef DYNAREC
-    int check = BOX64ENV(dynarec);
-    #endif
     //rb_set(mapallmem, cur, cur+size, MEM_ALLOCATED);
     while (cur < end) {
         uintptr_t bend;
@@ -2709,7 +2923,7 @@ void updateProtection(uintptr_t addr, size_t size, uint32_t prot)
                 /*if(!IsAddrMappingLoadAndClean(cur))
                     addDBFromAddressRange(cur, bend-cur);*/
             } else
-                cleanDBFromAddressRange(cur, bend-cur, (!prot)?1:0);
+                cleanDBFromAddressRange_internal(cur, bend-cur, (!prot)?1:0, destroy_locked);
         }
         #endif
         if(!(never)) {
@@ -2740,6 +2954,10 @@ void updateProtection(uintptr_t addr, size_t size, uint32_t prot)
         cur = bend;
     }
     UNLOCK_PROT();
+    #ifdef DYNAREC
+    if (destroy_locked)
+        mutex_unlock(&my_context->mutex_dyndump);
+    #endif
 }
 
 static void setProtection_generic(uintptr_t addr, size_t size, uint32_t prot, mem_flag_t flag)

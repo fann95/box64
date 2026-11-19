@@ -24,6 +24,7 @@
 #include "x64test.h"
 #include "dynarec/dynarec_next.h"
 #include "random.h"
+#include "arm64_lock.h"
 
 static const int8_t mask_shift8[] = { -7, -6, -5, -4, -3, -2, -1, 0 };
 static const int8_t mask_string8[] = { 7, 6, 5, 4, 3, 2, 1, 0 };
@@ -40,6 +41,8 @@ void PrintTrace() {}
 uintptr_t getConst(arm64_consts_t which)
 {
     switch(which) {
+        case const_arm64_lock_xadd_unaligned: return (uintptr_t)arm64_lock_xadd_unaligned;
+        case const_arm64_lock_rmw_unaligned: return (uintptr_t)arm64_lock_rmw_unaligned;
         case const_none: dynarec_log(LOG_NONE, "Warning, const none used\n");
             return 0;
         case const_daa8: return (uintptr_t)daa8;

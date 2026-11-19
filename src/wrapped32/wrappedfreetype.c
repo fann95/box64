@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include "wrappedlibs.h"
 
@@ -1601,8 +1602,8 @@ void convert_FT_Outline_to_64(void* d, void* s)
     int n = dst->n_points;
     FT_Vector_32_t* vec = (FT_Vector_32_t*)dst->points;
     for(int i=n-1; i>=0; --i) {
-        dst->points[i].x = from_long(vec[i].x);
         dst->points[i].y = from_long(vec[i].y);
+        dst->points[i].x = from_long(vec[i].x);
     }
 }
 
@@ -2144,6 +2145,25 @@ static void my_FT_Stream_CloseFunc(FT_StreamRec_t* stream)
     convert_FT_StreamRec_to_64(stream, &stream_s);
 }
 
+typedef struct {
+    void* library;
+    unsigned int refs;
+} ft_face_info_t;
+KHASH_MAP_INIT_INT(ft_faces, ft_face_info_t);
+static kh_ft_faces_t* ft_faces = NULL;
+static pthread_mutex_t ft_faces_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void track_FT_Face(void* library, void* face)
+{
+    if(!face) return;
+    pthread_mutex_lock(&ft_faces_mutex);
+    if(!ft_faces) ft_faces = kh_init(ft_faces);
+    int r;
+    khint_t k = kh_put(ft_faces, ft_faces, (uintptr_t)face, &r);
+    kh_value(ft_faces, k) = (ft_face_info_t){library, 1};
+    pthread_mutex_unlock(&ft_faces_mutex);
+}
+
 EXPORT int my32_FT_Open_Face(x64emu_t* emu, void* library, FT_Open_Args_32_t* args, long face_index, ptr_t* aface)
 {
     (void)emu;
@@ -2191,6 +2211,7 @@ EXPORT int my32_FT_Open_Face(x64emu_t* emu, void* library, FT_Open_Args_32_t* ar
         args->stream->close = (void*)my_closefunc;
     }*/
     *aface = to_ptrv(aface_l);
+    if(!ret) track_FT_Face(library, aface_l);
     inplace_FT_FaceRec_shrink(aface_l);
     return ret;
 }
@@ -2222,6 +2243,7 @@ EXPORT int my32_FT_New_Face(x64emu_t* emu, void* lib, void* name, long index, pt
     int ret = my->FT_New_Face(lib, name, index, &res);
     if(ret) return ret;
     *face = to_ptrv(res);
+    track_FT_Face(lib, res);
     inplace_FT_FaceRec_shrink(res);
     return ret;
 }
@@ -2232,6 +2254,7 @@ EXPORT int my32_FT_New_Memory_Face(x64emu_t* emu, void* lib, void* base, long si
     int ret = my->FT_New_Memory_Face(lib, base, size, index, &res);
     if(ret) return ret;
     *face = to_ptrv(res);
+    track_FT_Face(lib, res);
     inplace_FT_FaceRec_shrink(res);
     return ret;
 }
@@ -2373,24 +2396,17 @@ EXPORT int my32_FT_Get_BDF_Property(x64emu_t* emu, void* face, void* name, BDF_P
     return ret;
 }
 
-KHASH_MAP_INIT_INT(face_ref, uintptr_t);
-
-static kh_face_ref_t *face_ref = NULL;
-
 EXPORT int my32_FT_Reference_Face(x64emu_t* emu, void* face)
 {
     inplace_FT_FaceRec_enlarge(face);
     int ret = my->FT_Reference_Face(face);
     inplace_FT_FaceRec_shrink(face);
     if(!ret) {
-        if(!face_ref) face_ref = kh_init(face_ref);
-        khint_t k = kh_get(face_ref, face_ref, (uintptr_t)face);
-        if(k==kh_end(face_ref)) {
-            int r;
-            k = kh_put(face_ref, face_ref, (uintptr_t)face, &r);
-            kh_value(face_ref, k) = 0;
-        }
-        ++kh_value(face_ref, k);
+        pthread_mutex_lock(&ft_faces_mutex);
+        khint_t k;
+        if(ft_faces && (k=kh_get(ft_faces, ft_faces, (uintptr_t)face))!=kh_end(ft_faces))
+            ++kh_value(ft_faces, k).refs;
+        pthread_mutex_unlock(&ft_faces_mutex);
     }
     return ret;
 }
@@ -2399,16 +2415,45 @@ EXPORT int my32_FT_Done_Face(x64emu_t* emu, void* face)
 {
     int will_keep = 0;
     khint_t k;
-    if(face_ref && ((k=kh_get(face_ref, face_ref, (uintptr_t)face)!=kh_end(face_ref))))
-        will_keep = 1;
+    pthread_mutex_lock(&ft_faces_mutex);
+    if(ft_faces && (k=kh_get(ft_faces, ft_faces, (uintptr_t)face))!=kh_end(ft_faces))
+        will_keep = kh_value(ft_faces, k).refs>1;
+    pthread_mutex_unlock(&ft_faces_mutex);
     inplace_FT_FaceRec_enlarge(face);
     int ret = my->FT_Done_Face(face);
-    if(will_keep) {
+    if(ret || will_keep)
         inplace_FT_FaceRec_shrink(face);
-        --kh_value(face_ref, k);
-        if(!kh_value(face_ref, k))
-            kh_del(face_ref, face_ref, k);
+    if(!ret) {
+        pthread_mutex_lock(&ft_faces_mutex);
+        if(ft_faces && (k=kh_get(ft_faces, ft_faces, (uintptr_t)face))!=kh_end(ft_faces)) {
+            if(!--kh_value(ft_faces, k).refs)
+                kh_del(ft_faces, ft_faces, k);
+        }
+        pthread_mutex_unlock(&ft_faces_mutex);
     }
+    return ret;
+}
+
+EXPORT int my32_FT_Done_FreeType(x64emu_t* emu, void* library)
+{
+    // FreeType also destroys faces that the guest has not released explicitly.
+    pthread_mutex_lock(&ft_faces_mutex);
+    if(ft_faces)
+        for(khint_t k=kh_begin(ft_faces); k!=kh_end(ft_faces); ++k)
+            if(kh_exist(ft_faces, k) && kh_value(ft_faces, k).library==library)
+                inplace_FT_FaceRec_enlarge((void*)(uintptr_t)kh_key(ft_faces, k));
+    pthread_mutex_unlock(&ft_faces_mutex);
+    int ret = my->FT_Done_FreeType(library);
+    pthread_mutex_lock(&ft_faces_mutex);
+    if(ft_faces)
+        for(khint_t k=kh_begin(ft_faces); k!=kh_end(ft_faces); ++k)
+            if(kh_exist(ft_faces, k) && kh_value(ft_faces, k).library==library) {
+                if(ret)
+                    inplace_FT_FaceRec_shrink((void*)(uintptr_t)kh_key(ft_faces, k));
+                else
+                    kh_del(ft_faces, ft_faces, k);
+            }
+    pthread_mutex_unlock(&ft_faces_mutex);
     return ret;
 }
 
@@ -2644,6 +2689,7 @@ EXPORT void my32_FT_Outline_Get_CBox(x64emu_t* emu, FT_Outline_32_t* outline, FT
     FT_BBox_t res = {0};
     convert_FT_Outline_to_64(&outline_l, outline);
     my->FT_Outline_Get_CBox(&outline_l, &res);
+    convert_FT_Outline_to_32(outline, &outline_l);
     bbox->xMin = to_long(res.xMin);
     bbox->yMin = to_long(res.yMin);
     bbox->xMax = to_long(res.xMax);
@@ -2859,5 +2905,9 @@ EXPORT void my32_FT_Done_Glyph(x64emu_t* emu, void* glyph)
     inplace_FT_Glyph_enlarge(glyph);
     my->FT_Done_Glyph(glyph);
 }
+
+#define CUSTOM_FINI \
+    kh_destroy(ft_faces, ft_faces); \
+    ft_faces = NULL;
 
 #include "wrappedlib_init32.h"

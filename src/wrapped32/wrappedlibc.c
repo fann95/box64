@@ -2365,7 +2365,8 @@ EXPORT unsigned long int my32___fdelt_chk (unsigned long int d)
   if (d >= FD_SETSIZE)
     __chk_fail ();
 
-  return d / __NFDBITS;
+  // i386 fd_set uses 32-bit words on every host.
+  return d / 32;
 }
 #endif
 
@@ -3522,7 +3523,7 @@ EXPORT int my32_sched_getaffinity(x64emu_t* emu, pid_t pid, size_t sz, cpu_set_t
     int ret = sched_getaffinity(pid, sz, (cpu_set_t*)mask_);
     if(ret>=0) {
         cpumask_shiftright(mask_, sz, BOX64ENV(skipcpu));
-        cpumask_maxcpu(mask, sz, BOX64ENV(maxcpu));
+        cpumask_maxcpu(mask_, sz, BOX64ENV(maxcpu));
         memcpy(mask, mask_, sz);
     }
     return ret;
@@ -3542,7 +3543,7 @@ EXPORT int my32_sched_setaffinity(x64emu_t* emu, pid_t pid, size_t sz, cpu_set_t
         return sched_setaffinity(pid, sz, mask);
     uint8_t mask_[sz];
     memcpy(mask_, mask, sz);
-    cpumask_maxcpu(mask, sz, BOX64ENV(maxcpu));
+    cpumask_maxcpu(mask_, sz, BOX64ENV(maxcpu));
     cpumask_shiftleft(mask_, sz, BOX64ENV(skipcpu));
     return sched_setaffinity(pid, sz, (cpu_set_t*)mask_);
 }

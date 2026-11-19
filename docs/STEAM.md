@@ -19,6 +19,10 @@ For additional stability with Box64 when Box86 is unavailable, it is recommended
 - Steam > Settings > Interface > Client Beta Participation: Steam Beta > Restart Now
 - Steam > Settings > Interface > Use experimental SteamRT3 Steam Client: On > Restart Now
 
+### Steam Overlay in this fork
+
+`install_steam.sh` does not configure the overlay-filtering launch helpers. For the tested CS2 and CS 1.6 launch options on NVIDIA GB10, see [Steam Overlay on NVIDIA GB10 in the README](../README.md#steam-overlay-on-nvidia-gb10).
+
 ## Install and run Windows Steam
 
 It's simple, just download it from Steam website and install it like other Windows applications.

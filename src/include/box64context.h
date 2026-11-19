@@ -225,6 +225,7 @@ typedef struct box64context_s {
 
     uintptr_t           *auxval_start;
 
+    pthread_mutex_t     mutex_cleanup;
     cleanup_t           *cleanups;          // atexit functions
     int                 clean_sz;
     int                 clean_cap;

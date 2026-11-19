@@ -21,6 +21,7 @@ typedef void* (*pFpu_t)(void*, uint32_t);
 typedef void* (*pFpp_t)(void*, void*);
 typedef void* (*pFpV_t)(void*, ...);
 typedef void* (*pFppp_t)(void*, void*, void*);
+typedef uint32_t (*uFppip_t)(void*, void*, int32_t, void*);
 typedef int32_t (*iFppiUi_t)(void*, void*, int32_t, uint64_t, int32_t);
 typedef void* (*pFppibp_p_t)(void*, void*, int32_t, struct_p_t*, void*);
 typedef void* (*pFppipipp_t)(void*, void*, int32_t, void*, int32_t, void*, void*);
@@ -35,6 +36,7 @@ typedef void* (*pFppipipp_t)(void*, void*, int32_t, void*, int32_t, void*, void*
 	GO(FcObjectSetBuild, pFpV_t) \
 	GO(FcPatternBuild, pFpV_t) \
 	GO(FcFontList, pFppp_t) \
+	GO(FcPatternGet, uFppip_t) \
 	GO(FcPatternAdd, iFppiUi_t) \
 	GO(FcFontSort, pFppibp_p_t) \
 	GO(FcFontSetSort, pFppipipp_t)

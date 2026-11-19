@@ -196,7 +196,10 @@ void emuthread_destroy(void* p)
 	#ifdef BAD_PKILL
 	del_thread((void*)et->self);
 	#endif
+	int counted_worker = et->counted_worker;
 	box_free(et);
+	if(counted_worker)
+		atomic_fetch_sub_explicit(&g_active_emu_workers, 1, memory_order_release);
 }
 
 static void emuthread_cancel(void* p)
@@ -223,7 +226,6 @@ static void emuthread_cancel(void* p)
 	box_free(et->cancels);
 	et->cancels=NULL;
 	et->cancel_size = et->cancel_cap = 0;
-	atomic_fetch_sub_explicit(&g_active_emu_workers, 1, memory_order_relaxed);
 }
 void thread_forget_emu()
 {
@@ -313,6 +315,8 @@ void thread_set_et(emuthread_t* et)
 
 static void* pthread_routine(void* p)
 {
+	emuthread_t *et = (emuthread_t*)p;
+	et->counted_worker = 1;
 	atomic_fetch_add_explicit(&g_active_emu_workers, 1, memory_order_relaxed);
 	// free current emuthread if it exist
 	{
@@ -325,7 +329,6 @@ static void* pthread_routine(void* p)
 	}
 	pthread_setspecific(thread_key, p);
 	// call the function
-	emuthread_t *et = (emuthread_t*)p;
 	et->emu->type = EMUTYPE_MAIN;
 	// setup callstack and run...
 	x64emu_t* emu = et->emu;
@@ -347,7 +350,6 @@ static void* pthread_routine(void* p)
 	DynaRun(emu);
 	pthread_cleanup_pop(0);
 	void* ret = (void*)R_RAX;
-	atomic_fetch_sub_explicit(&g_active_emu_workers, 1, memory_order_relaxed);
 	//void* ret = (void*)RunFunctionWithEmu(et->emu, 0, et->fnc, 1, et->arg);
 	return ret;
 }
@@ -805,9 +807,38 @@ static void* findkey_dtorFct(void* fct)
 
 #undef SUPER
 
-// custom implementation of pthread_once...
+typedef struct once_callback_s {
+	x64emu_t* emu;
+	void* callback;
+} once_callback_t;
+
+static __thread once_callback_t* current_once_callback;
+
+static void native_once_callback(void)
+{
+	x64emu_t* emu = current_once_callback->emu;
+	void* callback = current_once_callback->callback;
+	Push64(emu, R_RBP);
+	R_RBP = R_RSP;
+	R_RSP &= ~63LL;
+	DynaCall(emu, (uintptr_t)callback, 0);
+	R_RSP = R_RBP;
+	R_RBP = Pop64(emu);
+}
+
 int EXPORT my_pthread_once(x64emu_t* emu, int* once, void* cb)
 {
+	if(!box64_wine) {
+		// Let libc publish completion and handle waiters, cancellation and fork.
+		// Keep callback arguments per thread so nested once controls are independent.
+		once_callback_t call = {emu, cb};
+		once_callback_t* previous = current_once_callback;
+		current_once_callback = &call;
+		int ret = pthread_once((pthread_once_t*)once, native_once_callback);
+		current_once_callback = previous;
+		return ret;
+	}
+	// Retain the existing Wine loader workaround for its recursive initialization.
 	if(*once==1)	// quick test first
 		return 0;
 	if(__sync_bool_compare_and_swap(once, 0, 2)) {

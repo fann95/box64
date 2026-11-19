@@ -2,6 +2,8 @@
 
 # Box64: Linux Userspace x86-64 Emulator with a Twist
 
+> **Local fork:** AI-assisted fixes tested on ASUS Ascent GX10 (NVIDIA GB10) with Ubuntu 24.04, based on upstream commit [`27c8275d8`](https://github.com/ptitSeb/box64/commit/27c8275d8295f521bb40faf920788ac5116dbfb0). See the [Steam launch configuration](#steam-overlay-on-nvidia-gb10) below for the setup used with CS2 and CS 1.6.
+
 [Website](https://box86.org/) | [Changelog](https://github.com/ptitSeb/box64/blob/main/docs/CHANGELOG.md) | [中文](https://github.com/ptitSeb/box64/blob/main/README_CN.md) | [Українська](https://github.com/ptitSeb/box64/blob/main/README_UK.md) | [Report an Error](https://github.com/ptitSeb/box64/issues/new)
 
 ![Build Status](https://github.com/ptitSeb/box64/actions/workflows/release.yml/badge.svg) ![Stars](https://img.shields.io/github/stars/ptitSeb/box64) ![Forks](https://img.shields.io/github/forks/ptitSeb/box64) ![Contributors](https://img.shields.io/github/contributors/ptitSeb/box64) ![Pull Requests](https://img.shields.io/github/issues-pr/ptitSeb/box64) ![Issues](https://img.shields.io/github/issues/ptitSeb/box64)
@@ -90,6 +92,32 @@ For more information, check [Usage Documentation](docs/USAGE.md).
 ### Steam
 
 See [Steam Documentation](docs/STEAM.md).
+
+#### Steam Overlay on NVIDIA GB10
+
+On our GB10 setup, CS2 still loaded `gameoverlayrenderer.so` with the Steam Overlay switch turned off in the game's settings. Its input-event queue filled up and caused repeated waits and a sustained FPS drop. The launch helpers in this fork remove only `gameoverlayrenderer.so` from `LD_PRELOAD` and `BOX64_LD_PRELOAD` before starting the game, preserving other preloaded libraries and game arguments.
+
+**`install_steam.sh` does not install these helpers or configure game launch options.** After installing Steam and this fork of Box64, configure each game below in **Properties > General > Launch Options**. Keep Steam Overlay disabled in the game's settings as well.
+
+The examples assume this repository is at `$HOME/box64`. Adjust the helper paths if you put it elsewhere, and keep the checkout at that location while these launch options refer to it. Steam client updates do not overwrite these scripts in the Box64 checkout.
+
+**Counter-Strike 2:**
+
+```bash
+BOX64_DYNAREC_STRONGMEM=4 BOX64_DYNAREC_NOHOSTEXT=uscat GAME_DEBUGGER="$HOME/box64/tests/cs2_core_launch.sh" %command%
+```
+
+[`tests/cs2_core_launch.sh`](tests/cs2_core_launch.sh) launches the installed `/usr/local/bin/box64`. It keeps its historical filename so existing launch options continue to work. It does not raise core-dump limits, enable JIT profiling, create diagnostic files, or select an old diagnostic build. The old `build/cs2-profile/capture-jit-next` marker is no longer used. Normal Steam logging and any externally configured diagnostics retain their own settings.
+
+**Counter-Strike 1.6:**
+
+```bash
+BOX64_DYNAREC_STRONGMEM=3 BOX64_DYNAREC_NOHOSTEXT=uscat DEBUGGER="$HOME/box64/tests/steam_no_overlay.sh" %command%
+```
+
+[`tests/steam_no_overlay.sh`](tests/steam_no_overlay.sh) filters the overlay preload and executes the game's original command. GoldSrc uses `DEBUGGER`; CS2 uses `GAME_DEBUGGER`. This preserves the existing CS 1.6 launch path through binfmt and the installed Box64.
+
+These are the launch options tested on our GB10 system. Keep the memory-ordering options scoped to these games. Updating the helper scripts does not require rebuilding or reinstalling Box64. They filter the game's environment without modifying Steam's installed libraries.
 
 ### Wine
 

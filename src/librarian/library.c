@@ -652,7 +652,19 @@ void Free1Library(library_t **the_lib, x64emu_t* emu)
 
     library_t* lib = *the_lib;
 
+    elfheader_t* h = GetElf(lib);
+    if(h) {
+        if(h->tls_dtor_count || h->unloading)
+            return;
+        h->unloading = 1;
+    }
     FiniLibrary(lib, emu);
+    // A finalizer can reopen the DSO or register a thread-local destructor.
+    if(h) {
+        h->unloading = 0;
+        if(h->tls_dtor_count || h->refcnt > 0)
+            return;
+    }
 
     printf_dlsym_dump(LOG_DEBUG, "Free1Library %s\n", lib->name?:"???");
     // remove lib from maplib/local_maplib...
@@ -683,13 +695,7 @@ void Free1Library(library_t **the_lib, x64emu_t* emu)
     }
 
     // No "Fini" logic here, only memory handling
-    if(lib->maplib && !lib->maplib_ref) {
-        lib_t* maplib = lib->maplib;
-        lib->maplib = NULL;
-        FreeLibrarian(&maplib, emu);
-    }
-    lib->maplib = NULL;
-    lib->maplib_ref = 0;
+    DetachLibraryMaplib(lib, emu, 1);
     if(lib_type!=LIB_UNNKNOW && lib->fini) {
         lib->fini(lib);
     }
@@ -1516,6 +1522,18 @@ int GetRefCount(library_t* lib)
         default:
             return 0;
     }
+}
+
+void ReleaseThreadCleanupDso(elfheader_t* h, x64emu_t* emu)
+{
+    if(!h)
+        return;
+    lockLibLoader();
+    if(h->tls_dtor_count && !--h->tls_dtor_count && !h->refcnt && h->lib) {
+        library_t* lib = h->lib;
+        Free1Library(&lib, emu);
+    }
+    unlockLibLoader();
 }
 
 void SetDlOpenIdx(library_t* lib, int dlopen)

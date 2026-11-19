@@ -15,6 +15,7 @@ typedef struct emuthread_s {
 	ulong_t 	hself;
 	void*		pthread_t_addr;
 	int			pthread_t_ready;
+	int			counted_worker; // 64-bit worker stays active through thread-local cleanup
 	int			cancel_cap, cancel_size;
 	void**		cancels;
 } emuthread_t;

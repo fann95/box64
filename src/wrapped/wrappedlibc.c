@@ -3926,9 +3926,7 @@ EXPORT void my__Jv_RegisterClasses() {}
 
 EXPORT int32_t my___cxa_thread_atexit_impl(x64emu_t* emu, void* dtor, void* obj, void* dso)
 {
-    (void)dso;
-    AddThreadCleanup(emu, dtor, obj);
-    return 0;
+    return AddThreadCleanup(emu, dtor, obj, dso);
 }
 
 EXPORT int32_t my_delete_module(x64emu_t* emu, const char* name, unsigned int flags)
@@ -4550,12 +4548,15 @@ EXPORT void* my_mremap(x64emu_t* emu, void* old_addr, size_t old_size, size_t ne
     last_mmap_0_len = 0;
     #endif
     (void)emu;
-    uint32_t oldflag = (uint32_t)memExist((uintptr_t)old_addr);
     lockMmapMutex();
+    uint32_t oldflag = (uint32_t)memExist((uintptr_t)old_addr);
     if((emu || box64_is32bits) && (BOX64ENV(log)>=LOG_DEBUG || BOX64ENV(dynarec_log)>=LOG_DEBUG)) {printf_log(LOG_NONE, "mremap(%p, %lu, %lu, %d, %p)=>", old_addr, old_size, new_size, flags, new_addr);}
     void* ret = mremap(old_addr, old_size, new_size, flags, new_addr);
     if((emu || box64_is32bits) && (BOX64ENV(log)>=LOG_DEBUG || BOX64ENV(dynarec_log)>=LOG_DEBUG)) {printf_log(LOG_NONE, "%p\n", ret);}
     if(ret!=(void*)-1) {
+        // The kernel resizes whole host pages, even for byte-sized requests.
+        old_size = ALIGN(old_size);
+        new_size = ALIGN(new_size);
         uint32_t prot = getProtection((uintptr_t)old_addr)&~PROT_CUSTOM;
         if(ret==old_addr) {
             if(old_size && old_size<new_size) {
@@ -5951,7 +5952,7 @@ EXPORT int my_sched_getaffinity(x64emu_t* emu, pid_t pid, size_t sz, cpu_set_t* 
     int ret = sched_getaffinity(pid, sz, (cpu_set_t*)mask_);
     if(ret>=0) {
         cpumask_shiftright(mask_, sz, skipcpu);
-        cpumask_maxcpu(mask, sz, maxcpu);
+        cpumask_maxcpu(mask_, sz, maxcpu);
         memcpy(mask, mask_, sz);
     }
     return ret;
@@ -6000,7 +6001,7 @@ EXPORT int my_sched_setaffinity(x64emu_t* emu, pid_t pid, size_t sz, cpu_set_t* 
         return sched_setaffinity(pid, sz, mask);
     uint8_t mask_[sz];
     memcpy(mask_, mask, sz);
-    cpumask_maxcpu(mask, sz, maxcpu);
+    cpumask_maxcpu(mask_, sz, maxcpu);
     cpumask_shiftleft(mask_, sz, skipcpu);
     return sched_setaffinity(pid, sz, (cpu_set_t*)mask_);
 }

@@ -142,42 +142,67 @@ int AllocLoadElfMemory32(box64context_t* context, elfheader_t* head, int mainbin
             ++head->multiblock_n;
         }
 
-    if(!head->vaddr && BOX64ENV(load_addr)) {
-        offs = to_ptrv(find31bitBlockNearHint((void*)BOX64ENV(load_addr), head->memsz, max_align));
-        BOX64ENV(load_addr) = offs + head->memsz;
-        BOX64ENV(load_addr) = (BOX64ENV(load_addr)+0x10ffffff)&~0xffffff;
-    }
-    if(!offs && !head->vaddr)
-        offs = (uintptr_t)find31bitBlockElf(head->memsz, mainbin, max_align);
     // prereserve the whole elf image, without populating
-    size_t sz = head->memsz;
-    void* raw = NULL;
-    void* image = NULL;
+    const uintptr_t limit = 1ULL << 32;
+    size_t padding = head->vaddr ? (head->vaddr & max_align) : head->align;
+    if(head->memsz > limit || padding > limit - head->memsz || head->vaddr >= limit) {
+        printf_log(LOG_NONE, "Error: ELF image is too large for the 32-bit address space: \"%s\"\n", head->name);
+        return 1;
+    }
+    size_t sz = head->memsz + padding;
+    void* raw = MAP_FAILED;
+    void* image = MAP_FAILED;
+    lockMmapMutex();
     if(!head->vaddr) {
-        sz += head->align;
-        raw = mmap(from_ptrv(offs), sz, 0, MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE, -1, 0);
-        image = (void*)(((uintptr_t)raw+max_align)&~max_align);
-    } else {
-        if(from_ptr(head->vaddr)&(box64_pagesize-1)) {
-            // load address is not page-aligned, round down and increase size
-            uintptr_t aligned_addr = ALIGN_DOWN(from_ptr(head->vaddr));
-            size_t extra = from_ptr(head->vaddr) - aligned_addr;
-            raw = mmap((void*)aligned_addr, sz + extra, 0, MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE, -1, 0);
-            if(raw != MAP_FAILED && (uintptr_t)raw == aligned_addr) {
-                image = from_ptrv(head->vaddr);
-                sz += extra;
-            } else {
-                image = raw;
+        for(int attempt = 0; attempt < 3; ++attempt) {
+            uintptr_t candidate = 0;
+            if(BOX64ENV(load_addr) && BOX64ENV(load_addr) < limit)
+                candidate = (uintptr_t)find31bitBlockNearHint((void*)ALIGN(BOX64ENV(load_addr)), sz, max_align);
+            if(!candidate)
+                candidate = (uintptr_t)find31bitBlockElf(sz, mainbin, max_align);
+            if(!candidate || candidate >= limit || sz > limit - candidate) {
+                errno = ENOMEM;
+                break;
             }
-        } else {
-            image = raw = mmap(from_ptrv(head->vaddr), sz, 0, MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE, -1, 0);
+            offs = candidate;
+            raw = InternalMmap(from_ptrv(offs), sz, 0, MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE, -1, 0);
+            if(raw == MAP_FAILED)
+                break;
+            if((uintptr_t)raw < limit && sz <= limit - (uintptr_t)raw)
+                break;
+            // A native allocation can take the hint before mmap; refresh and retry below 4 GiB.
+            InternalMunmap(raw, sz);
+            raw = MAP_FAILED;
+            errno = ENOMEM;
+            loadProtectionFromMap();
         }
+        if(raw != MAP_FAILED) {
+            image = (void*)ALIGN((uintptr_t)raw);
+            if(BOX64ENV(load_addr)) {
+                BOX64ENV(load_addr) = (uintptr_t)image + head->memsz;
+                BOX64ENV(load_addr) = (BOX64ENV(load_addr)+0x10ffffff)&~0xffffff;
+            }
+        }
+    } else {
+        uintptr_t aligned_addr = ALIGN_DOWN(head->vaddr);
+        raw = InternalMmap((void*)aligned_addr, sz, 0, MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE, -1, 0);
+        if(raw != MAP_FAILED && (uintptr_t)raw == aligned_addr) {
+            image = from_ptrv(head->vaddr);
+        } else {
+            image = raw;
+        }
+    }
+    if(raw != MAP_FAILED && ((uintptr_t)raw >= limit || sz > limit - (uintptr_t)raw)) {
+        InternalMunmap(raw, sz);
+        image = MAP_FAILED;
+        errno = ENOMEM;
     }
     if(image!=MAP_FAILED && !head->vaddr && image!=from_ptrv(offs)) {
         printf_log(LOG_INFO, "%s: Mmap64 for (@%p 0x%zx) for elf \"%s\" returned %p(%p/0x%zx) instead\n", (((uintptr_t)image)&max_align)?"Error":"Warning", from_ptrv(head->vaddr?head->vaddr:offs), head->memsz, head->name, image, raw, head->align);
         offs = to_ptrv(image);
         if(((uintptr_t)image)&max_align) {
-            munmap(raw, sz);
+            InternalMunmap(raw, sz);
+            unlockMmapMutex();
             return 1;   // that's an error, alocated memory is not aligned properly
         }
     }
@@ -188,8 +213,10 @@ int AllocLoadElfMemory32(box64context_t* context, elfheader_t* head, int mainbin
         } else {
             printf_log_prefix(0, LOG_NONE, " got %p\n", image);
         }
-        if(image==MAP_FAILED)
+        if(image==MAP_FAILED) {
+            unlockMmapMutex();
             return 1;
+        }
         offs = to_ptrv(image)-head->vaddr;
     }
     printf_dump(log_level, "Pre-allocated 0x%zx byte at %p for %s\n", head->memsz, image, head->name);
@@ -200,6 +227,7 @@ int AllocLoadElfMemory32(box64context_t* context, elfheader_t* head, int mainbin
     head->raw = raw;
     head->raw_size = sz;
     setProtection_elf((uintptr_t)raw, sz, 0);
+    unlockMmapMutex();
 
     head->multiblocks = (multiblock_t*)box_calloc(head->multiblock_n, sizeof(multiblock_t));
     head->tlsbase = AddTLSPartition(context, head->tlssize);

@@ -100,6 +100,7 @@ void relockMutex(int locks)
 
 void init_mutexes(box64context_t* context)
 {
+    pthread_mutex_init(&context->mutex_cleanup, NULL);
 #ifndef DYNAREC
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -421,6 +422,7 @@ void FreeBox64Context(box64context_t** context)
 
     finiAllHelpers(ctx);
 
+    pthread_mutex_destroy(&ctx->mutex_cleanup);
 #ifdef DYNAREC
     pthread_mutex_destroy(&ctx->mutex_lock);
 #else

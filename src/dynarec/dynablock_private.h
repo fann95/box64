@@ -24,8 +24,9 @@ typedef struct dynablock_s {
     int             size;
     uint32_t        hash;
     uint8_t         done;
-    uint8_t         gone;
+    uint8_t         gone;       // 0: live, 1: invalidated, 2: queued for reclamation
     uint8_t         dirty;      // if need to be tested as soon as it's created
+    uint8_t         retire_lost; // atomically requested retirement after losing the jump-table entry
     uint8_t         always_test:2;
     uint8_t         is32bits:1;
     uint8_t         autocrc:1;

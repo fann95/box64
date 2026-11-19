@@ -881,6 +881,7 @@ def readFiles(files: Iterable[str]) -> Tuple[JumbledFunctions, JumbledFunctions,
 							 \
 							 or match("libc",        "tcmallocminimal") \
 							 or match("libc",        "ldlinux") 	\
+							 or (match("libc", "libbsd") and s in ("arc4random", "arc4random_buf", "arc4random_uniform")) \
 							:
 								# libc and ldlinux have some "__libc_" data symbols in common... TODO check if ok
 								continue

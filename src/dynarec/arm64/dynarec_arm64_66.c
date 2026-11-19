@@ -21,6 +21,7 @@
 #include "dynarec_arm64_private.h"
 #include "../dynarec_helper.h"
 #include "dynarec_arm64_functions.h"
+#include "arm64_lock.h"
 
 
 uintptr_t dynarec64_66(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst, rex_t rex, int* ok, int* need_epilog)
@@ -618,6 +619,9 @@ uintptr_t dynarec64_66(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                 BFIz(gd, ed, 0, 16);
                 BFIz(ed, x1, 0, 16);
             } else {
+                READFLAGS(X_ALL);
+                CHECK_DFNONE(1);
+                GETIP(ip);
                 GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &ed, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                 if(!ALIGNED_ATOMICH) {
@@ -639,6 +643,17 @@ uintptr_t dynarec64_66(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                 }
                 if(!ALIGNED_ATOMICH) {
                     MARK;
+                    ANDx_mask(x1, ed, 1, 0, 3);
+                    CMPSw_U12(x1, 14);
+                    B_MARK3(cGT);
+                    MOVx_REG(x1, ed);
+                    MOVw_REG(x2, gd);
+                    MOV32w(x3, 2);
+                    MOV32w(x4, ARM64_RMW_XCHG);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK3;
                     LDRH_U12(x1, ed, 0);
                     LDAXRB(x3, ed);
                     STLXRB(x3, gd, ed);

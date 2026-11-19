@@ -798,16 +798,14 @@ static kh_mapping_entry_t* mapping_entries = NULL;
 void RecordEnvMappings(uintptr_t addr, size_t length, int fd)
 {
 #ifndef _WIN32
-    if (!envmap) { envmap = rbtree_init("envmap"); }
-    if(!mapping_entries) mapping_entries = kh_init(mapping_entry);
-
     char* filename = NULL;
-    static char fullname[4096];
-    if (fd > 0) {
-        static char buf[128];
+    char fullname[4096];
+    if (fd >= 0) {
+        char buf[128];
         sprintf(buf, "/proc/self/fd/%d", fd);
         ssize_t r = readlink(buf, fullname, sizeof(fullname) - 1);
-        if (r != -1) fullname[r] = 0;
+        if (r < 0) return;
+        fullname[r] = 0;
 
         filename = strrchr(fullname, '/');
     }
@@ -817,7 +815,7 @@ void RecordEnvMappings(uintptr_t addr, size_t length, int fd)
     if(strstr(lowercase_filename, "/memfd:")==lowercase_filename) {
         // memfd, first remove the (deleted) at the end
         char* p = strstr(lowercase_filename, " (deleted)");
-        if(p == lowercase_filename+strlen(lowercase_filename)-strlen(" (deleted)")) {
+        if(p && !strcmp(p, " (deleted)")) {
             *p = '\0';
         }
         // add the "/fd" at the end to differenciate between memfd
@@ -827,6 +825,8 @@ void RecordEnvMappings(uintptr_t addr, size_t length, int fd)
         lowercase_filename = new_name;
     }
     mutex_lock(&my_context->mutex_dyndump);
+    if (!envmap) { envmap = rbtree_init("envmap"); }
+    if(!mapping_entries) mapping_entries = kh_init(mapping_entry);
     int ret;
     mapping_t* mapping = NULL;
     int new_mapping = 0;
@@ -862,7 +862,8 @@ void RecordEnvMappings(uintptr_t addr, size_t length, int fd)
             }
     }
     rb_set_64(envmap, addr, addr + length, (uint64_t)mapping);
-    mutex_unlock(&my_context->mutex_dyndump);
+    // RemoveMapping may free both mapping and its names. Keep it protected
+    // through cache loading and the final environment access.
     if(new_mapping) {
         // First time we see this file
         if (box64_wine && BOX64ENV(unityplayer)) DetectUnityPlayer(lowercase_filename+1);
@@ -879,6 +880,7 @@ void RecordEnvMappings(uintptr_t addr, size_t length, int fd)
         printf_log(LOG_DEBUG, "Applied [%s] of range %p:%p\n", filename, addr, addr + length);
         PrintEnvVariables(mapping->env, LOG_DEBUG);
     }
+    mutex_unlock(&my_context->mutex_dyndump);
     box_free(lowercase_filename);
 #endif
 }
@@ -886,15 +888,15 @@ void RecordEnvMappings(uintptr_t addr, size_t length, int fd)
 void WillRemoveMapping(uintptr_t addr, size_t length)
 {
     #ifdef DYNAREC
-    if(!envmap) return;
-    mapping_t* mapping = (mapping_t*)rb_get_64(envmap, addr);
+    if(!my_context) return;
+    mutex_lock(&my_context->mutex_dyndump);
+    mapping_t* mapping = envmap ? (mapping_t*)rb_get_64(envmap, addr) : NULL;
     if(mapping) {
         if(MmaplistHasNew(mapping->mmaplist, 1)) {
-            mutex_lock(&my_context->mutex_dyndump);
             SerializeMmaplist(mapping);
-            mutex_unlock(&my_context->mutex_dyndump);
         }
     }
+    mutex_unlock(&my_context->mutex_dyndump);
     #endif
 }
 

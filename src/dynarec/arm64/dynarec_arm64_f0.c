@@ -19,6 +19,7 @@
 #include "dynarec_arm64_private.h"
 #include "../dynarec_helper.h"
 #include "dynarec_arm64_functions.h"
+#include "arm64_lock.h"
 
 
 uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst, rex_t rex, int* ok, int* need_epilog)
@@ -80,10 +81,13 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
             } else {
                 INST_NAME("LOCK ADD Ed, Gd");
                 SETFLAGS(X_ALL, SF_SET_PENDING);
+                CHECK_DFNONE(1);
+                GETIP(ip);
                 GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                 if(!ALIGNED_ATOMICxw) {
-                    if(cpuext.uscat) {
+                    // LDAXR/STLXR still require natural alignment without LSE.
+                    if(cpuext.uscat && cpuext.atomics) {
                         ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
                         CMPSw_U12(x1, 16-(1<<(2+rex.w)));
                         B_MARK(cGT);
@@ -107,7 +111,19 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                 }
                 if(!ALIGNED_ATOMICxw) {
                     B_MARK2_nocond;
-                    MARK;   // unaligned! also, not enough
+                    MARK;
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                    B_MARK3(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVxw_REG(x2, gd);
+                    MOV32w(x3, 1<<(2+rex.w));
+                    MOV32w(x4, ARM64_RMW_ADD);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK3;
+                    // Legacy cross-16 fallback; the split store is not atomic.
                     LDRxw_U12(x1, wback, 0);
                     LDAXRB(x4, wback);
                     SUBxw_UXTB(x4, x4, x1); // substract with the byte only
@@ -160,19 +176,37 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
             } else {
                 INST_NAME("LOCK OR Ed, Gd");
                 SETFLAGS(X_ALL, SF_SET_PENDING);
+                CHECK_DFNONE(1);
+                GETIP(ip);
                 GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
+                if(!ALIGNED_ATOMICxw) {
+                    TSTx_mask(wback, 1, 0, 1+rex.w);
+                    B_MARK(cEQ);
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                    B_MARK(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVxw_REG(x2, gd);
+                    MOV32w(x3, 1<<(2+rex.w));
+                    MOV32w(x4, ARM64_RMW_OR);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK;
+                }
                 if(cpuext.atomics) {
                     LDSETALxw(gd, x1, wback);
-                    UFLAG_IF {
-                        emit_or32(dyn, ninst, rex, x1, gd, x3, x4);
-                    }
                 } else {
                     MARKLOCK;
                     LDAXRxw(x1, wback);
-                    emit_or32(dyn, ninst, rex, x1, gd, x3, x4);
-                    STLXRxw(x3, x1, wback);
+                    ORRxw_REG(x4, x1, gd);
+                    STLXRxw(x3, x4, wback);
                     CBNZx_MARKLOCK(x3);
+                }
+                MARK2;
+                UFLAG_IF {
+                    emit_or32(dyn, ninst, rex, x1, gd, x3, x4);
                 }
             }
             break;
@@ -281,18 +315,16 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                             } else {
                                 INST_NAME("LOCK CMPXCHG Ed, Gd");
                                 SETFLAGS(X_ALL, SF_SET_PENDING);
+                                CHECK_DFNONE(1);
+                                GETIP(ip);
                                 GETGD;
                                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                                 UFLAG_IF { MOVxw_REG(x5, xRAX); }
                                 if(!ALIGNED_ATOMICxw) {
-                                    if(cpuext.uscat) {
-                                        ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
-                                        CMPSw_U12(x1, 16-(1<<(2+rex.w)));
-                                        B_MARK3(cGT);
-                                    } else {
-                                        TSTx_mask(wback, 1, 0, 1+rex.w);    // mask=3 or 7
-                                        B_MARK3(cNE);
-                                    }
+                                    // The active fast path uses LDAXR, which requires
+                                    // natural alignment even when USCAT is available.
+                                    TSTx_mask(wback, 1, 0, 1+rex.w);    // mask=3 or 7
+                                    B_MARK3(cNE);
                                 }
                                 // Aligned version
                                 // disabling use of atomics for now, as it seems to make (at least)
@@ -330,6 +362,22 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                                 if(!ALIGNED_ATOMICxw) {
                                     // Unaligned version
                                     MARK3;
+                                    ANDx_mask(x1, wback, 1, 0, 3);
+                                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                                    B_MARK2(cGT);
+                                    MOVx_REG(x1, wback);
+                                    MOVxw_REG(x2, gd);
+                                    MOV32w(x3, 1<<(2+rex.w));
+                                    MOV32w(x4, ARM64_RMW_CMPXCHG);
+                                    MOVxw_REG(x5, xRAX);
+                                    STORE_XEMU_CALL(xRIP);
+                                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                                    MOVxw_REG(x5, xRAX);
+                                    CMPSxw_REG(xRAX, x1);
+                                    B_MARK(cEQ);
+                                    MOVxw_REG(xRAX, x1);
+                                    B_MARK_nocond;
+                                    MARK2;
                                     LDRxw_U12(x1, wback, 0);
                                     LDAXRB(x3, wback); // dummy read, to arm the write...
                                     SUBxw_UXTB(x3, x3, x1);
@@ -629,10 +677,12 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                             } else {
                                 INST_NAME("LOCK XADD Ed, Gd");
                                 SETFLAGS(X_ALL, SF_SET_PENDING);
+                                CHECK_DFNONE(1);
+                                GETIP(ip);
                                 GETGD;
                                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                                 if(!ALIGNED_ATOMICxw) {
-                                    if(cpuext.uscat) {
+                                    if(cpuext.uscat && cpuext.atomics) {
                                         ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
                                         CMPSw_U12(x1, 16-(1<<(2+rex.w)));
                                         B_MARK(cGT);
@@ -662,6 +712,20 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                                         B_NEXT_nocond;
                                     }
                                     MARK;
+                                    // Keep the whole field atomic, including when it crosses
+                                    // an 8-byte boundary. The helper preserves neighboring bytes.
+                                    ANDx_mask(x1, wback, 1, 0, 3);
+                                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                                    B_MARK3(cGT);
+                                    MOVx_REG(x1, wback);
+                                    MOVxw_REG(x2, gd);
+                                    MOV32w(x3, 1<<(2+rex.w));
+                                    STORE_XEMU_CALL(xRIP);
+                                    CALL(const_arm64_lock_xadd_unaligned, x1);
+                                    B_MARK2_nocond;
+                                    MARK3;
+                                    // A field spanning two aligned 16-byte blocks still uses
+                                    // the existing split-access fallback.
                                     LDRxw_U12(x1, wback, 0);
                                     LDAXRB(x4, wback);
                                     SUBxw_UXTB(x4, x4, x1);
@@ -708,7 +772,7 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                                 // commit df before branch, CALL_S in GPF path has FORCE_DFNONE
                                 if(rex.w && BOX64DRENV(dynarec_safeflags)>1)
                                     CHECK_DFNONE(0);
-                                if(cpuext.uscat) {
+                                if(cpuext.uscat && cpuext.atomics) {
                                     if(rex.w) {
                                         TSTx_mask(wback, 1, 0, 3);
                                         B_MARK2(cNE);
@@ -840,16 +904,44 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                 *ok = 0;
             } else {
                 INST_NAME("LOCK ADC Ed, Gd");
+                #if STEP == 0
+                // Alignment checks and the helper clobber native carry before
+                // the shared flag emitter consumes it. Keep incoming CF in xFlags.
+                dyn->insts[ninst].nat_flags_op_before = NAT_FLAG_OP_UNUSABLE;
+                #endif
                 READFLAGS(X_CF);
                 SETFLAGS(X_ALL, SF_SET_PENDING);
+                CHECK_DFNONE(1);
+                GETIP(ip);
                 GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
-                MARKLOCK_SAVE_FLAGS();
+                if(!ALIGNED_ATOMICxw) {
+                    TSTx_mask(wback, 1, 0, 1+rex.w);
+                    B_MARK(cEQ);
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                    B_MARK(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVxw_REG(x2, gd);
+                    MOV32w(x3, 1<<(2+rex.w));
+                    MOV32w(x4, ARM64_RMW_ADC);
+                    UBFXw(x5, xFlags, F_CF, 1);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK;
+                }
+                UBFXw(x5, xFlags, F_CF, 1);
+                MARKLOCK;
                 LDAXRxw(x1, wback);
-                emit_adc32(dyn, ninst, rex, x1, gd, x4, x5);
-                STLXRxw(x4, x1, wback);
-                CBNZx_MARKLOCK(x4);
-                NATIVE_RESTORE_X87PC();
+                ADDxw_REG(x4, x1, gd);
+                ADDxw_REG(x4, x4, x5);
+                STLXRxw(x3, x4, wback);
+                CBNZx_MARKLOCK(x3);
+                MARK2;
+                UFLAG_IF {
+                    emit_adc32(dyn, ninst, rex, x1, gd, x3, x4);
+                }
             }
             break;
         case 0x20:
@@ -891,22 +983,38 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
             } else {
                 INST_NAME("LOCK AND Ed, Gd");
                 SETFLAGS(X_ALL, SF_SET_PENDING);
+                CHECK_DFNONE(1);
+                GETIP(ip);
                 GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
+                if(!ALIGNED_ATOMICxw) {
+                    TSTx_mask(wback, 1, 0, 1+rex.w);
+                    B_MARK(cEQ);
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                    B_MARK(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVxw_REG(x2, gd);
+                    MOV32w(x3, 1<<(2+rex.w));
+                    MOV32w(x4, ARM64_RMW_AND);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK;
+                }
                 if(cpuext.atomics) {
                     MVNxw_REG(x1, gd);
-                    UFLAG_IF {
-                        LDCLRALxw(x1, x1, wback);
-                        emit_and32(dyn, ninst, rex, x1, gd, x3, x4);
-                    } else {
-                        STCLRLxw(x1, wback);
-                    }
+                    LDCLRALxw(x1, x1, wback);
                 } else {
                     MARKLOCK;
                     LDAXRxw(x1, wback);
-                    emit_and32(dyn, ninst, rex, x1, gd, x3, x4);
-                    STLXRxw(x3, x1, wback);
+                    ANDxw_REG(x4, x1, gd);
+                    STLXRxw(x3, x4, wback);
                     CBNZx_MARKLOCK(x3);
+                }
+                MARK2;
+                UFLAG_IF {
+                    emit_and32(dyn, ninst, rex, x1, gd, x3, x4);
                 }
             }
             break;
@@ -921,17 +1029,14 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
             } else {
                 INST_NAME("LOCK SUB Ed, Gd");
                 SETFLAGS(X_ALL, SF_SET_PENDING);
+                CHECK_DFNONE(1);
+                GETIP(ip);
                 GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                 if(!ALIGNED_ATOMICxw) {
-                    if(cpuext.uscat) {
-                        ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
-                        CMPSw_U12(x1, 16-(1<<(2+rex.w)));
-                        B_MARK(cGT);
-                    } else {
-                        TSTx_mask(wback, 1, 0, 1+rex.w);    // mask=3 or 7
-                        B_MARK(cNE);
-                    }
+                    // This fast path uses LL/SC: USCAT only relaxes LSE alignment.
+                    TSTx_mask(wback, 1, 0, 1+rex.w);    // mask=3 or 7
+                    B_MARK(cNE);
                 }
                 if(cpuext.atomics && 0) {    // disabled because 0x80000000 has no negative
                     NEGxw_REG(x1, gd);
@@ -953,7 +1058,19 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                     } else {
                         B_NEXT_nocond;
                     }
-                    MARK;   // unaligned! also, not enough
+                    MARK;
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                    B_MARK3(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVxw_REG(x2, gd);
+                    MOV32w(x3, 1<<(2+rex.w));
+                    MOV32w(x4, ARM64_RMW_SUB);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK3;
+                    // Legacy cross-16 fallback; the split store is not atomic.
                     LDRxw_U12(x1, wback, 0);
                     LDAXRB(x4, wback);
                     SUBxw_UXTB(x4, x4, x1);
@@ -963,8 +1080,8 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                     CBNZx_MARK(x3);
                     STRxw_U12(x4, wback, 0);    // put the whole value
                 }
+                MARK2;
                 UFLAG_IF {
-                    MARK2;
                     emit_sub32(dyn, ninst, rex, x1, gd, x3, x4);
                 }
             }
@@ -980,10 +1097,12 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
             } else {
                 INST_NAME("LOCK XOR Ed, Gd");
                 SETFLAGS(X_ALL, SF_SET_PENDING);
+                CHECK_DFNONE(1);
+                GETIP(ip);
                 GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                 if(!ALIGNED_ATOMICxw) {
-                    if(cpuext.uscat) {
+                    if(cpuext.uscat && cpuext.atomics) {
                         ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
                         CMPSw_U12(x1, 16-(1<<(2+rex.w)));
                         B_MARK(cGT);
@@ -1007,7 +1126,19 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                 }
                 if(!ALIGNED_ATOMICxw) {
                     B_MARK2_nocond;
-                    MARK;   // unaligned! also, not enough
+                    MARK;
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                    B_MARK3(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVxw_REG(x2, gd);
+                    MOV32w(x3, 1<<(2+rex.w));
+                    MOV32w(x4, ARM64_RMW_XOR);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK3;
+                    // Legacy cross-16 fallback; the split store is not atomic.
                     LDRxw_U12(x1, wback, 0);
                     LDAXRB(x4, wback);
                     SUBxw_UXTB(x4, x4, x1);
@@ -1248,7 +1379,7 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                             MOV64xw(x5, i64);
                         }
                         if(!ALIGNED_ATOMICxw) {
-                            if(cpuext.uscat) {
+                            if(cpuext.uscat && cpuext.atomics) {
                                 ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
                                 CMPSw_U12(x1, 16-(1<<(2+rex.w)));
                                 B_MARK(cGT);
@@ -1426,7 +1557,7 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                             MOV64xw(x5, i64);
                         }
                         if(!ALIGNED_ATOMICxw) {
-                            if(cpuext.uscat) {
+                            if(cpuext.uscat && cpuext.atomics) {
                                 ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
                                 CMPSw_U12(x1, 16-(1<<(2+rex.w)));
                                 B_MARK(cGT);
@@ -1564,10 +1695,13 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                 *ok = 0;
             } else {
                 INST_NAME("LOCK XCHG Ed, Gd");
+                READFLAGS(X_ALL);
+                CHECK_DFNONE(1);
+                GETIP(ip);
                 GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &ed, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                 if(!ALIGNED_ATOMICxw) {
-                    if(cpuext.uscat) {
+                    if(cpuext.uscat && cpuext.atomics) {
                         ANDx_mask(x1, ed, 1, 0, 3);  // mask = F
                         CMPSw_U12(x1, 16-(1<<(2+rex.w)));
                         B_MARK(cGT);
@@ -1592,6 +1726,18 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                 }
                 if(!ALIGNED_ATOMICxw) {
                     MARK;
+                    ANDx_mask(x1, ed, 1, 0, 3);
+                    CMPSw_U12(x1, 16-(1<<(2+rex.w)));
+                    B_MARK3(cGT);
+                    MOVx_REG(x1, ed);
+                    MOVxw_REG(x2, gd);
+                    MOV32w(x3, 1<<(2+rex.w));
+                    MOV32w(x4, ARM64_RMW_XCHG);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK3;
+                    // Legacy cross-16 fallback; the split store is not atomic.
                     LDRxw_U12(x1, ed, 0);
                     LDAXRB(x4, ed);
                     SUBxw_UXTB(x4, x4, x1);
@@ -1748,7 +1894,7 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                         SETFLAGS(X_ALL&~X_CF, SF_SUBSET);
                         addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                         if(!ALIGNED_ATOMICxw) {
-                            if(cpuext.uscat) {
+                            if(cpuext.uscat && cpuext.atomics) {
                                 ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
                                 CMPSw_U12(x1, 16-(1<<(2+rex.w)));
                                 B_MARK(cGT);
@@ -1804,7 +1950,7 @@ uintptr_t dynarec64_F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                         SETFLAGS(X_ALL&~X_CF, SF_SUBSET);
                         addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                         if(!ALIGNED_ATOMICxw) {
-                            if(cpuext.uscat) {
+                            if(cpuext.uscat && cpuext.atomics) {
                                 ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
                                 CMPSw_U12(x1, 16-(1<<(2+rex.w)));
                                 B_MARK(cGT);

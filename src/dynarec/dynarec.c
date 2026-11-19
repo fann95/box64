@@ -33,7 +33,7 @@
 
 extern int running32bits;
 #ifdef DYNAREC
-void* LinkNext(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
+static void* LinkNextImpl(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
 {
     int is32bits = (R_CS == 0x23);
     if(!running32bits && is32bits) running32bits=1;
@@ -107,7 +107,15 @@ void* LinkNext(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
     //dynablock_t *father = block->father?block->father:block;
     return jblock;
 }
-void* LinkNextInvalid(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
+void* LinkNext(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
+{
+    int saved_errno = errno;
+    void* ret = LinkNextImpl(emu, addr, x2, x3);
+    errno = saved_errno;
+    return ret;
+}
+
+static void* LinkNextInvalidImpl(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
 {
     // like LinkNext, but invalidate the db found first
     int is32bits = (R_CS == 0x23);
@@ -126,6 +134,14 @@ void* LinkNextInvalid(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
             return db->block;
     }
     return LinkNext(emu, addr, x2, x3);
+}
+
+void* LinkNextInvalid(x64emu_t* emu, uintptr_t addr, void* x2, uintptr_t* x3)
+{
+    int saved_errno = errno;
+    void* ret = LinkNextInvalidImpl(emu, addr, x2, x3);
+    errno = saved_errno;
+    return ret;
 }
 #endif
 

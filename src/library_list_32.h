@@ -16,6 +16,8 @@ GO("libdl.so.2", libdl)
 #endif
 GO("libresolv.so.2", libresolv)
 GO("libresolv.so", libresolv)
+GO("libbsd.so.0", libbsd)
+GO("libbsd.so", libbsd)
 GO("libselinux.so.1", selinux)
 GO("libselinux.so", selinux)
 GO("libblkid.so.1", blkid)

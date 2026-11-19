@@ -224,6 +224,37 @@ EXPORT int my32_FcPatternAdd(void* p, void* object, int type, fcvalue_32_t t, in
     return my->FcPatternAdd_(p, object, val, append);
 }
 
+EXPORT uint32_t my32_FcPatternGet(x64emu_t* emu, void* p, void* object, int id, FcValue_32_t* value)
+{
+    FcValue_t native = {0};
+    uint32_t ret = my->FcPatternGet(p, object, id, value ? &native : NULL);
+    if (ret || !value)
+        return ret;
+
+    // FcValue's union starts at offset 4 on i386, but at offset 8 on the host.
+    FcValue_32_t converted = {0};
+    converted.type = native.type;
+    switch (native.type) {
+        case 1: // FcTypeInteger
+        case 4: // FcTypeBool
+            converted.u.i = native.u.i;
+            break;
+        case 2: // FcTypeDouble
+            converted.u.d = native.u.d;
+            break;
+        case 3: // FcTypeString
+        case 5: // FcTypeMatrix
+        case 6: // FcTypeCharSet
+        case 7: // FcTypeFTFace
+        case 8: // FcTypeLangSet
+        case 9: // FcTypeRange
+            converted.u.c = to_ptrv(native.u.c);
+            break;
+    }
+    *value = converted;
+    return ret;
+}
+
 void inplace_FT_FaceRec_shrink(void* face);
 void inplace_FT_FaceRec_enlarge(void* face);
 EXPORT uint32_t my32_FcFreeTypeCharIndex(x64emu_t* emu, void* face, uint32_t u)

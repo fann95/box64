@@ -20,6 +20,7 @@
 #include "dynarec_arm64_private.h"
 #include "../dynarec_helper.h"
 #include "dynarec_arm64_functions.h"
+#include "arm64_lock.h"
 
 
 uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int ninst, rex_t rex, int* ok, int* need_epilog)
@@ -52,21 +53,38 @@ uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int n
             } else {
                 INST_NAME("LOCK ADD Ew, Gw");
                 SETFLAGS(X_ALL, SF_SET_PENDING);
-                GETGW(x5);
+                CHECK_DFNONE(1);
+                GETIP(ip);
+                GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
+                if(!ALIGNED_ATOMICH) {
+                    TSTx_mask(wback, 1, 0, 0);
+                    B_MARK(cEQ);
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 14);
+                    B_MARK(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVx_REG(x2, gd);
+                    MOV32w(x3, 2);
+                    MOV32w(x4, ARM64_RMW_ADD);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK;
+                }
                 if(cpuext.atomics) {
-                    UFLAG_IF {
-                        LDADDALH(x5, x1, wback);
-                        emit_add16(dyn, ninst, x1, x5, x3, x4);
-                    } else {
-                        STADDLH(x5, wback);
-                    }
+                    LDADDALH(gd, x1, wback);
                 } else {
                     MARKLOCK;
                     LDAXRH(x1, wback);
-                    emit_add16(dyn, ninst, x1, x5, x3, x4);
-                    STLXRH(x3, x1, wback);
+                    ADDw_REG(x4, x1, gd);
+                    STLXRH(x3, x4, wback);
                     CBNZx_MARKLOCK(x3);
+                }
+                MARK2;
+                UFLAG_IF {
+                    UXTHw(x5, gd);
+                    emit_add16(dyn, ninst, x1, x5, x3, x4);
                 }
             }
             break;
@@ -81,21 +99,38 @@ uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int n
             } else {
                 INST_NAME("LOCK OR Ew, Gw");
                 SETFLAGS(X_ALL, SF_SET_PENDING);
-                GETGW(x5);
+                CHECK_DFNONE(1);
+                GETIP(ip);
+                GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
+                if(!ALIGNED_ATOMICH) {
+                    TSTx_mask(wback, 1, 0, 0);
+                    B_MARK(cEQ);
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 14);
+                    B_MARK(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVx_REG(x2, gd);
+                    MOV32w(x3, 2);
+                    MOV32w(x4, ARM64_RMW_OR);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK;
+                }
                 if(cpuext.atomics) {
-                    UFLAG_IF {
-                        LDSETALH(x5, x1, wback);
-                        emit_or16(dyn, ninst, x1, x5, x3, x4);
-                    } else {
-                        STSETLH(x5, wback);
-                    }
+                    LDSETALH(gd, x1, wback);
                 } else {
                     MARKLOCK;
                     LDAXRH(x1, wback);
-                    emit_or16(dyn, ninst, x1, x5, x3, x4);
-                    STLXRH(x3, x1, wback);
+                    ORRw_REG(x4, x1, gd);
+                    STLXRH(x3, x4, wback);
                     CBNZx_MARKLOCK(x3);
+                }
+                MARK2;
+                UFLAG_IF {
+                    UXTHw(x5, gd);
+                    emit_or16(dyn, ninst, x1, x5, x3, x4);
                 }
             }
             break;
@@ -114,11 +149,13 @@ uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int n
                     } else {
                         INST_NAME("LOCK CMPXCHG Ew, Gw");
                         SETFLAGS(X_ALL, SF_SET_PENDING);
+                        CHECK_DFNONE(1);
+                        GETIP(ip);
                         GETGD;
                         UXTHw(x5, xRAX);
                         addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
                         if(!ALIGNED_ATOMICH) {
-                            if(cpuext.uscat) {
+                            if(cpuext.uscat && cpuext.atomics) {
                                 ANDx_mask(x1, wback, 1, 0, 3);  // mask = F
                                 CMPSw_U12(x1, 0xF);
                                 B_MARK3(cGE);
@@ -145,6 +182,19 @@ uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int n
                             B_MARK_nocond;
                             // Unaligned version
                             MARK3;
+                            ANDx_mask(x1, wback, 1, 0, 3);
+                            CMPSw_U12(x1, 14);
+                            B_MARK2(cGT);
+                            MOVx_REG(x1, wback);
+                            MOVx_REG(x2, gd);
+                            MOV32w(x3, 2);
+                            MOV32w(x4, ARM64_RMW_CMPXCHG);
+                            UXTHx(x5, xRAX);
+                            STORE_XEMU_CALL(xRIP);
+                            CALL(const_arm64_lock_rmw_unaligned, x1);
+                            UXTHw(x5, xRAX);
+                            B_MARK_nocond;
+                            MARK2;
                             LDRH_U12(x1, wback, 0);
                             LDAXRB(x3, wback); // dummy read, to arm the write...
                             SUBw_UXTB(x3, x3, x1);
@@ -173,9 +223,27 @@ uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int n
                     } else {
                         INST_NAME("LOCK XADD Gw, Ew");
                         SETFLAGS(X_ALL, SF_SET_PENDING);
+                        CHECK_DFNONE(1);
+                        GETIP(ip);
                         gd = TO_NAT(((nextop & 0x38) >> 3) + (rex.r << 3));
                         UXTHx(x5, gd);
                         addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
+                        if(!ALIGNED_ATOMICH) {
+                            TSTx_mask(wback, 1, 0, 0);
+                            B_MARK(cEQ);
+                            ANDx_mask(x1, wback, 1, 0, 3);
+                            CMPSw_U12(x1, 14);
+                            B_MARK(cGT);
+                            MOVx_REG(x1, wback);
+                            MOVx_REG(x2, gd);
+                            MOV32w(x3, 2);
+                            MOV32w(x4, ARM64_RMW_ADD);
+                            STORE_XEMU_CALL(xRIP);
+                            CALL(const_arm64_lock_rmw_unaligned, x1);
+                            UXTHx(x5, gd);
+                            B_MARK2_nocond;
+                            MARK;
+                        }
                         if(cpuext.atomics) {
                             LDADDALH(x5, x1, wback);
                         } else {
@@ -185,6 +253,7 @@ uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int n
                             STLXRH(x3, x4, wback);
                             CBNZx_MARKLOCK(x3);
                         }
+                        MARK2;
                         IFX(X_ALL|X_PEND) {
                             MOVxw_REG(x2, x1);
                             emit_add16(dyn, ninst, x2, x5, x3, x4);
@@ -207,16 +276,43 @@ uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int n
                 *ok = 0;
             } else {
                 INST_NAME("LOCK ADC Ew, Gw");
+                #if STEP == 0
+                dyn->insts[ninst].nat_flags_op_before = NAT_FLAG_OP_UNUSABLE;
+                #endif
                 READFLAGS(X_CF);
                 SETFLAGS(X_ALL, SF_SET_PENDING);
-                GETGW(x5);
+                CHECK_DFNONE(1);
+                GETIP(ip);
+                GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
-                MARKLOCK_SAVE_FLAGS();
+                if(!ALIGNED_ATOMICH) {
+                    TSTx_mask(wback, 1, 0, 0);
+                    B_MARK(cEQ);
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 14);
+                    B_MARK(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVx_REG(x2, gd);
+                    MOV32w(x3, 2);
+                    MOV32w(x4, ARM64_RMW_ADC);
+                    UBFXw(x5, xFlags, F_CF, 1);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK;
+                }
+                UBFXw(x5, xFlags, F_CF, 1);
+                MARKLOCK;
                 LDAXRH(x1, wback);
-                emit_adc16(dyn, ninst, x1, x5, x3, x4);
-                STLXRH(x3, x1, wback);
+                ADDw_REG(x4, x1, gd);
+                ADDw_REG(x4, x4, x5);
+                STLXRH(x3, x4, wback);
                 CBNZx_MARKLOCK(x3);
-                NATIVE_RESTORE_X87PC();
+                MARK2;
+                UFLAG_IF {
+                    UXTHw(x5, gd);
+                    emit_adc16(dyn, ninst, x1, x5, x3, x4);
+                }
             }
             break;
 
@@ -230,22 +326,39 @@ uintptr_t dynarec64_66F0(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int n
             } else {
                 INST_NAME("LOCK AND Ew, Gw");
                 SETFLAGS(X_ALL, SF_SET_PENDING);
-                GETGW(x5);
+                CHECK_DFNONE(1);
+                GETIP(ip);
+                GETGD;
                 addr = geted(dyn, addr, ninst, nextop, &wback, x2, &fixedaddress, NULL, 0, 0, rex, LOCK_LOCK, 0, 0);
+                if(!ALIGNED_ATOMICH) {
+                    TSTx_mask(wback, 1, 0, 0);
+                    B_MARK(cEQ);
+                    ANDx_mask(x1, wback, 1, 0, 3);
+                    CMPSw_U12(x1, 14);
+                    B_MARK(cGT);
+                    MOVx_REG(x1, wback);
+                    MOVx_REG(x2, gd);
+                    MOV32w(x3, 2);
+                    MOV32w(x4, ARM64_RMW_AND);
+                    STORE_XEMU_CALL(xRIP);
+                    CALL(const_arm64_lock_rmw_unaligned, x1);
+                    B_MARK2_nocond;
+                    MARK;
+                }
                 if(cpuext.atomics) {
-                    MVNw_REG(x3, gd);
-                    UFLAG_IF {
-                        LDCLRALH(x3, x1, wback);
-                        emit_and16(dyn, ninst, x1, gd, x3, x4);
-                    } else {
-                        STCLRLH(x3, wback);
-                    }
+                    MVNw_REG(x1, gd);
+                    LDCLRALH(x1, x1, wback);
                 } else {
                     MARKLOCK;
                     LDAXRH(x1, wback);
-                    emit_and16(dyn, ninst, x1, gd, x3, x4);
-                    STLXRH(x3, x1, wback);
+                    ANDw_REG(x4, x1, gd);
+                    STLXRH(x3, x4, wback);
                     CBNZx_MARKLOCK(x3);
+                }
+                MARK2;
+                UFLAG_IF {
+                    UXTHw(x5, gd);
+                    emit_and16(dyn, ninst, x1, x5, x3, x4);
                 }
             }
             break;

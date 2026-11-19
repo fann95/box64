@@ -54,6 +54,7 @@ typedef int32_t (*iFppllp_t)(void*, void*, intptr_t, intptr_t, void*);
 	GO(FT_Done_Glyph, vFp_t) \
 	GO(FT_Activate_Size, iFp_t) \
 	GO(FT_Done_Face, iFp_t) \
+	GO(FT_Done_FreeType, iFp_t) \
 	GO(FT_Done_Size, iFp_t) \
 	GO(FT_GlyphSlot_Own_Bitmap, iFp_t) \
 	GO(FT_Has_PS_Glyph_Names, iFp_t) \

@@ -128,6 +128,8 @@ typedef struct elfheader_s {
     int         init_done;
     int         fini_done;
     int         refcnt;     // ref count for the elf
+    size_t      tls_dtor_count; // pending/running thread-local destructors; loader lock
+    int         unloading;  // protects reentrant finalization before unmapping
     int         gnuunique;  // set if contains some STB_GNU_UNIQUE binding, preventing dlclose to unload the lib
     int         dynamic_patched;
 

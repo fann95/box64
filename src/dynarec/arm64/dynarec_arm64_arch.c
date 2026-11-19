@@ -494,10 +494,14 @@ int is_addr_lrcpc(uintptr_t addr)
 int mark_db_lrcpc(dynablock_t* db, uintptr_t x64pc)
 {
     add_lrcpc_address(x64pc);
-    if(db->to_delete)
+    int memory_lock = LockDynablockMemory();
+    if(!IsDynablockLive(db) || db->gone || db->to_delete) {
+        UnlockDynablockMemory(memory_lock);
         return 2;   // already marked
+    }
     db->to_delete = 1; // mark block for deletion
     MarkDynablock(db);      // and mark it as dirty
+    UnlockDynablockMemory(memory_lock);
 if(BOX64ENV(showsegv)) printf_log(LOG_INFO, "Marked db %p as dirty, and address %p as avoid lrcpc\n", db, (void*)x64pc);
     return 2;   // marked, exit handling...
 }

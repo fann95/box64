@@ -28,6 +28,27 @@ extern void arm64_lock_read_dq(uint64_t * a, uint64_t* b, void* addr);
 // STLXRD of ADDR, return 0 if ok, 1 if not
 extern int arm64_lock_write_dq(uint64_t a, uint64_t b, void* addr);
 
+// Fetch-add a 2/4/8-byte field contained in one aligned 16-byte block.
+// The unused first argument keeps x0 available for the dynarec's emu pointer.
+extern uint64_t arm64_lock_xadd_unaligned(void* emu, void* addr, uint64_t val, unsigned size);
+
+typedef enum {
+    ARM64_RMW_ADD,
+    ARM64_RMW_OR,
+    ARM64_RMW_ADC,
+    ARM64_RMW_AND,
+    ARM64_RMW_XCHG,
+    ARM64_RMW_CMPXCHG,
+    ARM64_RMW_SUB,
+    ARM64_RMW_XOR,
+} arm64_rmw_op_t;
+
+// The entire 2/4/8-byte field must fit in one aligned 16-byte block.
+// Returns its previous value. Extra is carry-in (0 or 1) for ADC, the
+// expected value for CMPXCHG, and ignored for the other operations.
+extern uint64_t arm64_lock_rmw_unaligned(void* emu, void* addr, uint64_t val,
+                                        unsigned size, unsigned op, uint64_t extra);
+
 // Atomically exchange value at [p] with val, return old p
 extern uintptr_t arm64_lock_xchg_dd(void* p, uintptr_t val);
 extern uintptr_t arm64_atomic_xchg_dd(void* p, uintptr_t val);

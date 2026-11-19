@@ -230,6 +230,8 @@ void pressure_vessel(int argc, const char** argv, int nextarg, const char* prog)
             // runtime libs are put first, as the games are built against them
             GO("%s/lib/x86_64-linux-gnu", sniper)
             GO("%s/lib/i386-linux-gnu", sniper)
+            GO("%s/lib/x86_64-linux-gnu/pulseaudio", sniper)
+            GO("%s/lib/i386-linux-gnu/pulseaudio", sniper)
             GO("%s/lib/x86_64-linux-gnu/openblas", sniper)
             GO("%s/lib/i386-linux-gnu/openblas", sniper)
             GO("%s/lib/x86_64-linux-gnu/openblas-pthread", sniper)

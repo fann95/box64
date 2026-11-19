@@ -41,6 +41,14 @@ typedef struct mmaplist_s mmaplist_t;
 // custom protection flag to mark Page that are Write protected for Dynarec purpose
 uintptr_t AllocDynarecMap(uintptr_t x64_addr, size_t size, int is_new);
 void FreeDynarecMap(uintptr_t addr);
+// Metadata lifetime guard, ordered after mutex_dyndump when both are needed.
+// The token distinguishes an acquired mutex from an already-owned outer lock.
+int LockDynablockMemory(void);
+void UnlockDynablockMemory(int token);
+int IsDynablockLive(dynablock_t* db); // caller holds the memory guard
+void DeferLostDynablock(dynablock_t* db);
+// Caller owns mutex_dyndump, or all emulated threads have stopped for shutdown.
+void RetireLostDynablocks(void);
 mmaplist_t* NewMmaplist();
 void DelMmaplist(mmaplist_t* list);
 int MmaplistHasNew(mmaplist_t* list, int clear);
